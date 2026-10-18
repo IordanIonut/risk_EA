@@ -1,10 +1,7 @@
-"""Portfolio risk calculations and a terminal fallback.
+"""Portfolio cash-risk, grid-stress, and historical OHLC calculations.
 
 For the desktop interface, open risk_calculator_app.pyw.
 Terminal fallback: python risk_calculator.py
-
-This calculates cash risk budgets only. It does not convert a budget into lots;
-that requires symbol-specific tick value, contract size, and stop/stress distance.
 """
 
 from dataclasses import dataclass
@@ -58,6 +55,8 @@ class DailyBar:
     high: Decimal
     low: Decimal
     close: Decimal
+    spread_points: Decimal | None = None
+    spread_sample_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +68,12 @@ class HistoricalStress:
     bar_count: int
     start_date: str
     end_date: str
+    long_drawdown_pct: Decimal = ZERO
+    long_drawdown_peak_date: str = ""
+    long_drawdown_trough_date: str = ""
+    short_rally_pct: Decimal = ZERO
+    short_rally_trough_date: str = ""
+    short_rally_peak_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,34 @@ class GridSettingsSuggestion:
     loss_budget: Decimal
     stress_points: Decimal
     step_points: Decimal
+    worst_date: str = ""
+
+
+@dataclass(frozen=True)
+class HistoricalGridStress:
+    estimated_loss: Decimal
+    loss_budget: Decimal
+    recommended_max_lot: Decimal
+    worst_date: str
+    stress_points: Decimal
+    step_points: Decimal
+
+
+@dataclass(frozen=True)
+class HistoricalGridBacktest:
+    initial_equity: Decimal
+    final_equity: Decimal
+    net_profit: Decimal
+    max_drawdown_cash: Decimal
+    max_drawdown_pct: Decimal
+    drawdown_peak_date: str
+    drawdown_trough_date: str
+    worst_daily_loss: Decimal
+    worst_daily_loss_date: str
+    take_profit_count: int
+    max_open_trades: int
+    grid_exhausted: bool
+    end_date: str
 
 
 def calculate_portfolio(
@@ -154,7 +187,7 @@ def calculate_historical_stress(
     bars: Sequence[DailyBar],
     minimum_bars: int = 20,
 ) -> HistoricalStress:
-    """Find the worst daily adverse range from each prior close over the history."""
+    """Find worst daily shocks and peak-to-trough moves over the history."""
     if len(bars) < minimum_bars:
         raise ValueError(
             f"At least {minimum_bars} valid daily bars are required; received {len(bars)}."
@@ -168,6 +201,16 @@ def calculate_historical_stress(
     short_date = ""
     previous_close: Decimal | None = None
     previous_date = ""
+    peak_price = ZERO
+    peak_date = ""
+    long_drawdown = ZERO
+    long_drawdown_peak_date = ""
+    long_drawdown_trough_date = ""
+    trough_price: Decimal | None = None
+    trough_date = ""
+    short_rally = ZERO
+    short_rally_trough_date = ""
+    short_rally_peak_date = ""
 
     for bar in bars:
         if not bar.date or (previous_date and bar.date <= previous_date):
@@ -178,6 +221,18 @@ def calculate_historical_stress(
             or bar.high < bar.low
         ):
             raise ValueError(f"Historical bar {bar.date} contains invalid prices.")
+        if bar.spread_points is not None and (
+            not bar.spread_points.is_finite() or bar.spread_points < ZERO
+        ):
+            raise ValueError(f"Historical bar {bar.date} contains invalid spread.")
+        if bar.spread_sample_count is not None and (
+            not isinstance(bar.spread_sample_count, int)
+            or isinstance(bar.spread_sample_count, bool)
+            or bar.spread_sample_count < 0
+        ):
+            raise ValueError(
+                f"Historical bar {bar.date} contains an invalid spread sample count."
+            )
 
         reference = previous_close or bar.close
         daily_range = bar.high - bar.low
@@ -191,6 +246,25 @@ def calculate_historical_stress(
         if short_pct > short_move:
             short_move = short_pct
             short_date = bar.date
+
+        if bar.high > peak_price:
+            peak_price = bar.high
+            peak_date = bar.date
+        drawdown_pct = (peak_price - bar.low) * ONE_HUNDRED / peak_price
+        if drawdown_pct > long_drawdown:
+            long_drawdown = drawdown_pct
+            long_drawdown_peak_date = peak_date
+            long_drawdown_trough_date = bar.date
+
+        if trough_price is None or bar.low < trough_price:
+            trough_price = bar.low
+            trough_date = bar.date
+        rally_pct = (bar.high - trough_price) * ONE_HUNDRED / trough_price
+        if rally_pct > short_rally:
+            short_rally = rally_pct
+            short_rally_trough_date = trough_date
+            short_rally_peak_date = bar.date
+
         previous_close = bar.close
         previous_date = bar.date
 
@@ -202,6 +276,12 @@ def calculate_historical_stress(
         bar_count=len(bars),
         start_date=bars[0].date,
         end_date=bars[-1].date,
+        long_drawdown_pct=long_drawdown,
+        long_drawdown_peak_date=long_drawdown_peak_date,
+        long_drawdown_trough_date=long_drawdown_trough_date,
+        short_rally_pct=short_rally,
+        short_rally_trough_date=short_rally_trough_date,
+        short_rally_peak_date=short_rally_peak_date,
     )
 
 
@@ -214,8 +294,22 @@ def calculate_grid_stress(
     stress_points: Decimal,
     daily_budget: Decimal,
     budget_fraction: Decimal = Decimal("0.8"),
+    spread_points: Decimal = ZERO,
+    slippage_points: Decimal = ZERO,
+    commission_per_lot: Decimal = ZERO,
 ) -> StressResult:
     """Estimate open-position loss after an adverse move through a grid."""
+    numeric_inputs = (
+        initial_lot,
+        point_value_per_lot,
+        step_points,
+        multiplier,
+        stress_points,
+        daily_budget,
+        budget_fraction,
+    )
+    if any(not value.is_finite() for value in numeric_inputs):
+        raise ValueError("Grid inputs must be finite numbers.")
     if initial_lot <= ZERO:
         raise ValueError("Initial lot must be greater than zero.")
     if point_value_per_lot <= ZERO:
@@ -232,6 +326,11 @@ def calculate_grid_stress(
         raise ValueError("Daily budget must be greater than zero.")
     if not ZERO < budget_fraction <= ONE:
         raise ValueError("Budget fraction must be greater than 0 and at most 1.")
+    if any(
+        not value.is_finite() or value < ZERO
+        for value in (spread_points, slippage_points, commission_per_lot)
+    ):
+        raise ValueError("Spread, slippage, and commission must be finite and non-negative.")
 
     risk_budget = daily_budget * budget_fraction
 
@@ -242,7 +341,14 @@ def calculate_grid_stress(
             if entry_offset >= stress_points:
                 break
             trade_lot = lot * (multiplier ** trade_index)
-            loss += trade_lot * point_value_per_lot * (stress_points - entry_offset)
+            loss += (
+                trade_lot
+                * (
+                    point_value_per_lot
+                    * (stress_points - entry_offset + spread_points + slippage_points)
+                    + commission_per_lot
+                )
+            )
         return loss
 
     estimated_loss = loss_for(max_trades, initial_lot)
@@ -272,14 +378,35 @@ def suggest_safe_grid_settings(
     minimum_lot: Decimal,
     max_trades_limit: int = 20,
     budget_fraction: Decimal = Decimal("0.8"),
+    spread_points: Decimal = ZERO,
+    slippage_points: Decimal = ZERO,
+    commission_per_lot: Decimal = ZERO,
+    maximum_lot: Decimal | None = None,
 ) -> GridSettingsSuggestion:
     """Suggest fixed-lot settings that fit a modeled move and broker volume rules."""
+    if any(
+        not value.is_finite()
+        for value in (
+            stress_points,
+            step_points,
+            point_value_per_lot,
+            daily_budget,
+            lot_step,
+            minimum_lot,
+            budget_fraction,
+        )
+    ):
+        raise ValueError("Grid suggestion inputs must be finite numbers.")
     if stress_points <= ZERO or step_points <= ZERO:
         raise ValueError("Stress distance and Step must be greater than zero.")
     if point_value_per_lot <= ZERO or daily_budget <= ZERO:
         raise ValueError("Point value and daily budget must be greater than zero.")
     if lot_step <= ZERO or minimum_lot <= ZERO:
         raise ValueError("Broker lot step and minimum lot must be greater than zero.")
+    if maximum_lot is not None and (
+        not maximum_lot.is_finite() or maximum_lot < minimum_lot
+    ):
+        raise ValueError("Broker maximum lot must be finite and at least the minimum lot.")
     if max_trades_limit <= 0:
         raise ValueError("Max Trades limit must be greater than zero.")
     if not ZERO < budget_fraction <= ONE:
@@ -301,6 +428,9 @@ def suggest_safe_grid_settings(
             stress_points=stress_points,
             daily_budget=daily_budget,
             budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
         )
         if minimum_lot_result.estimated_loss > risk_budget:
             continue
@@ -314,12 +444,21 @@ def suggest_safe_grid_settings(
             stress_points=stress_points,
             daily_budget=daily_budget,
             budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
         )
         initial_lot = (
             (unit_lot_result.recommended_max_lot / lot_step)
             .to_integral_value(rounding=ROUND_FLOOR)
             * lot_step
         )
+        if maximum_lot is not None:
+            initial_lot = min(
+                initial_lot,
+                (maximum_lot / lot_step).to_integral_value(rounding=ROUND_FLOOR)
+                * lot_step,
+            )
         if initial_lot < minimum_lot:
             continue
 
@@ -332,6 +471,9 @@ def suggest_safe_grid_settings(
             stress_points=stress_points,
             daily_budget=daily_budget,
             budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
         )
         if result.estimated_loss <= risk_budget:
             return GridSettingsSuggestion(
@@ -352,10 +494,487 @@ def suggest_safe_grid_settings(
         stress_points=stress_points,
         daily_budget=daily_budget,
         budget_fraction=budget_fraction,
+        spread_points=spread_points,
+        slippage_points=slippage_points,
+        commission_per_lot=commission_per_lot,
     ).estimated_loss
     raise ValueError(
         "No safe setting fits the broker's minimum lot, even with Max Trades = 1: "
         f"modeled loss {minimum_loss} exceeds the risk allowance {risk_budget}."
+    )
+
+
+def replay_historical_grid(
+    bars: Sequence[DailyBar],
+    point_size: Decimal,
+    point_value_per_lot: Decimal,
+    step_value: Decimal,
+    step_is_percentage: bool,
+    initial_lot: Decimal,
+    max_trades: int,
+    multiplier: Decimal,
+    daily_budget: Decimal,
+    budget_fraction: Decimal = Decimal("0.8"),
+    spread_points: Decimal = ZERO,
+    slippage_points: Decimal = ZERO,
+    commission_per_lot: Decimal = ZERO,
+    is_long: bool = True,
+) -> HistoricalGridStress:
+    """Replay each daily bar as an independent adverse shock, not an EA backtest."""
+    calculate_historical_stress(bars)
+    if not point_size.is_finite() or point_size <= ZERO:
+        raise ValueError("MT5 point size must be a finite positive number.")
+    if not step_value.is_finite() or step_value <= ZERO:
+        raise ValueError("Step value must be a finite positive number.")
+
+    worst: HistoricalGridStress | None = None
+    previous_close: Decimal | None = None
+    for bar in bars:
+        reference = previous_close or bar.close
+        adverse_price_move = max(
+            bar.high - bar.low,
+            reference - bar.low if is_long else bar.high - reference,
+            ZERO,
+        )
+        if step_is_percentage:
+            step_points = reference * step_value / ONE_HUNDRED / point_size
+        else:
+            step_points = step_value
+        if step_points <= ZERO:
+            raise ValueError("Converted historical grid step must be positive.")
+        stress_points = adverse_price_move / point_size
+        if stress_points <= ZERO:
+            previous_close = bar.close
+            continue
+        stress = calculate_grid_stress(
+            initial_lot=initial_lot,
+            point_value_per_lot=point_value_per_lot,
+            step_points=step_points,
+            multiplier=multiplier,
+            max_trades=max_trades,
+            stress_points=stress_points,
+            daily_budget=daily_budget,
+            budget_fraction=budget_fraction,
+            spread_points=max(
+                spread_points,
+                bar.spread_points if bar.spread_points is not None else ZERO,
+            ),
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
+        )
+        candidate = HistoricalGridStress(
+            estimated_loss=stress.estimated_loss,
+            loss_budget=stress.loss_budget,
+            recommended_max_lot=stress.recommended_max_lot,
+            worst_date=bar.date,
+            stress_points=stress_points,
+            step_points=step_points,
+        )
+        if worst is None or candidate.estimated_loss > worst.estimated_loss:
+            worst = candidate
+        previous_close = bar.close
+
+    if worst is None:
+        raise ValueError("No valid adverse price movement was found in the history.")
+    return worst
+
+
+def backtest_historical_grid_campaign(
+    bars: Sequence[DailyBar],
+    initial_equity: Decimal,
+    point_size: Decimal,
+    point_value_per_lot: Decimal,
+    step_points: Decimal,
+    take_profit_points: Decimal,
+    initial_lot: Decimal,
+    max_trades: int,
+    multiplier: Decimal = ONE,
+    spread_points: Decimal = ZERO,
+    slippage_points: Decimal = ZERO,
+    commission_per_lot: Decimal = ZERO,
+    is_long: bool = True,
+) -> HistoricalGridBacktest:
+    """Replay one generic grid campaign in date order using adverse-first OHLC paths.
+
+    The campaign opens at the first bar's close, adds fixed-step entries, and
+    closes its basket once the weighted-average take-profit is reached. It does
+    not restart because an unknown EA's entry signal cannot be inferred.
+    """
+    calculate_historical_stress(bars)
+    positive_inputs = (
+        initial_equity,
+        point_size,
+        point_value_per_lot,
+        step_points,
+        take_profit_points,
+        initial_lot,
+        multiplier,
+    )
+    if any(not value.is_finite() or value <= ZERO for value in positive_inputs):
+        raise ValueError("Backtest prices, equity, lot, and grid settings must be positive and finite.")
+    if max_trades <= 0:
+        raise ValueError("Maximum trades must be greater than zero.")
+    if any(
+        not value.is_finite() or value < ZERO
+        for value in (spread_points, slippage_points, commission_per_lot)
+    ):
+        raise ValueError("Spread, slippage, and commission must be finite and non-negative.")
+
+    positions: list[tuple[Decimal, Decimal]] = []
+    balance = initial_equity
+    equity_peak = initial_equity
+    max_drawdown = ZERO
+    drawdown_peak_date = bars[0].date
+    drawdown_trough_date = bars[0].date
+    worst_daily_loss = ZERO
+    worst_daily_loss_date = bars[0].date
+    max_open_trades = 0
+    take_profit_count = 0
+    grid_exhausted = False
+
+    def spread_for(bar: DailyBar) -> Decimal:
+        return max(
+            spread_points,
+            bar.spread_points if bar.spread_points is not None else ZERO,
+        )
+
+    def equity_at(price: Decimal) -> Decimal:
+        floating = sum(
+            (
+                (price - entry if is_long else entry - price)
+                / point_size
+                * point_value_per_lot
+                * lot
+                for entry, lot in positions
+            ),
+            ZERO,
+        )
+        return balance + floating
+
+    def observe_equity(value: Decimal, bar_date: str) -> None:
+        nonlocal equity_peak, max_drawdown
+        nonlocal drawdown_peak_date, drawdown_trough_date
+        if value > equity_peak:
+            equity_peak = value
+            drawdown_peak_date = bar_date
+        drawdown = equity_peak - value
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+            drawdown_trough_date = bar_date
+
+    first_bar = bars[0]
+    positions.append((first_bar.close, initial_lot))
+    balance -= initial_lot * (
+        point_value_per_lot
+        * (spread_for(first_bar) + slippage_points)
+        + commission_per_lot
+    )
+    max_open_trades = 1
+    previous_close = first_bar.close
+    day_open_equity = initial_equity
+    opening_loss = max(initial_equity - balance, ZERO)
+    worst_daily_loss = opening_loss
+    observe_equity(balance, first_bar.date)
+
+    for bar in bars[1:]:
+        if not positions:
+            previous_close = bar.close
+            day_open_equity = balance
+            continue
+        step_price = step_points * point_size
+        adverse_price = bar.low if is_long else bar.high
+        favorable_price = bar.high if is_long else bar.low
+        next_entry = (
+            positions[-1][0] - step_price
+            if is_long
+            else positions[-1][0] + step_price
+        )
+
+        while len(positions) < max_trades and (
+            adverse_price <= next_entry if is_long else adverse_price >= next_entry
+        ):
+            fill_price = (
+                min(next_entry, previous_close)
+                if is_long
+                else max(next_entry, previous_close)
+            )
+            lot = initial_lot * (multiplier ** len(positions))
+            positions.append((fill_price, lot))
+            balance -= lot * (
+                point_value_per_lot
+                * (spread_for(bar) + slippage_points)
+                + commission_per_lot
+            )
+            max_open_trades = max(max_open_trades, len(positions))
+            next_entry = (
+                positions[-1][0] - step_price
+                if is_long
+                else positions[-1][0] + step_price
+            )
+
+        if len(positions) == max_trades and (
+            adverse_price <= next_entry if is_long else adverse_price >= next_entry
+        ):
+            grid_exhausted = True
+
+        adverse_equity = equity_at(adverse_price)
+        observe_equity(adverse_equity, bar.date)
+        daily_loss = max(day_open_equity - adverse_equity, ZERO)
+        if daily_loss > worst_daily_loss:
+            worst_daily_loss = daily_loss
+            worst_daily_loss_date = bar.date
+
+        total_lots = sum((lot for _, lot in positions), ZERO)
+        if total_lots > ZERO:
+            weighted_entry = sum(
+                (entry * lot for entry, lot in positions), ZERO
+            ) / total_lots
+            take_profit_price = (
+                weighted_entry + take_profit_points * point_size
+                if is_long
+                else weighted_entry - take_profit_points * point_size
+            )
+            take_profit_hit = (
+                favorable_price >= take_profit_price
+                if is_long
+                else favorable_price <= take_profit_price
+            )
+        else:
+            take_profit_hit = False
+
+        if take_profit_hit:
+            balance += sum(
+                (
+                    (take_profit_price - entry if is_long else entry - take_profit_price)
+                    / point_size
+                    * point_value_per_lot
+                    * lot
+                    for entry, lot in positions
+                ),
+                ZERO,
+            )
+            positions.clear()
+            take_profit_count += 1
+            observe_equity(balance, bar.date)
+        else:
+            observe_equity(equity_at(favorable_price), bar.date)
+
+        closing_equity = equity_at(bar.close)
+        observe_equity(closing_equity, bar.date)
+        daily_loss = max(day_open_equity - min(adverse_equity, closing_equity), ZERO)
+        if daily_loss > worst_daily_loss:
+            worst_daily_loss = daily_loss
+            worst_daily_loss_date = bar.date
+        day_open_equity = closing_equity
+        previous_close = bar.close
+
+    if positions:
+        last_bar = bars[-1]
+        balance += sum(
+            (
+                (last_bar.close - entry if is_long else entry - last_bar.close)
+                / point_size
+                * point_value_per_lot
+                * lot
+                for entry, lot in positions
+            ),
+            ZERO,
+        )
+    final_equity = balance
+    observe_equity(final_equity, bars[-1].date)
+    return HistoricalGridBacktest(
+        initial_equity=initial_equity,
+        final_equity=final_equity,
+        net_profit=final_equity - initial_equity,
+        max_drawdown_cash=max_drawdown,
+        max_drawdown_pct=(
+            max_drawdown * ONE_HUNDRED / equity_peak
+            if equity_peak > ZERO
+            else ZERO
+        ),
+        drawdown_peak_date=drawdown_peak_date,
+        drawdown_trough_date=drawdown_trough_date,
+        worst_daily_loss=worst_daily_loss,
+        worst_daily_loss_date=worst_daily_loss_date,
+        take_profit_count=take_profit_count,
+        max_open_trades=max_open_trades,
+        grid_exhausted=grid_exhausted,
+        end_date=bars[-1].date,
+    )
+
+
+def suggest_safe_grid_settings_from_history(
+    bars: Sequence[DailyBar],
+    point_size: Decimal,
+    point_value_per_lot: Decimal,
+    step_value: Decimal,
+    step_is_percentage: bool,
+    daily_budget: Decimal,
+    lot_step: Decimal,
+    minimum_lot: Decimal,
+    max_trades_limit: int = 20,
+    budget_fraction: Decimal = Decimal("0.8"),
+    spread_points: Decimal = ZERO,
+    slippage_points: Decimal = ZERO,
+    commission_per_lot: Decimal = ZERO,
+    is_long: bool = True,
+    maximum_lot: Decimal | None = None,
+) -> GridSettingsSuggestion:
+    """Suggest fixed lots using the worst independent daily OHLC shock in history."""
+    calculate_historical_stress(bars)
+    if any(
+        not value.is_finite()
+        for value in (
+            point_size,
+            point_value_per_lot,
+            step_value,
+            daily_budget,
+            lot_step,
+            minimum_lot,
+            budget_fraction,
+        )
+    ):
+        raise ValueError("Historical grid inputs must be finite numbers.")
+    if point_size <= ZERO:
+        raise ValueError("MT5 point size must be a finite positive number.")
+    if point_value_per_lot <= ZERO or daily_budget <= ZERO:
+        raise ValueError("Point value and daily budget must be positive.")
+    if step_value <= ZERO:
+        raise ValueError("Step value must be a finite positive number.")
+    if lot_step <= ZERO or minimum_lot <= ZERO:
+        raise ValueError("Broker lot step and minimum lot must be greater than zero.")
+    if maximum_lot is not None and (
+        not maximum_lot.is_finite() or maximum_lot < minimum_lot
+    ):
+        raise ValueError("Broker maximum lot must be finite and at least the minimum lot.")
+    if not ZERO < budget_fraction <= ONE:
+        raise ValueError("Budget fraction must be greater than 0 and at most 1.")
+    if any(
+        not value.is_finite() or value < ZERO
+        for value in (spread_points, slippage_points, commission_per_lot)
+    ):
+        raise ValueError("Spread, slippage, and commission must be finite and non-negative.")
+    if max_trades_limit <= 0:
+        raise ValueError("Max Trades limit must be greater than zero.")
+
+    candidate_trades = 0
+    previous_close: Decimal | None = None
+    for bar in bars:
+        reference = previous_close or bar.close
+        adverse_points = max(
+            bar.high - bar.low,
+            reference - bar.low if is_long else bar.high - reference,
+            ZERO,
+        ) / point_size
+        step_points = (
+            reference * step_value / ONE_HUNDRED / point_size
+            if step_is_percentage
+            else step_value
+        )
+        if step_points > ZERO:
+            candidate_trades = max(
+                candidate_trades,
+                int((adverse_points / step_points).to_integral_value(rounding=ROUND_CEILING)),
+            )
+        previous_close = bar.close
+    candidate_trades = min(max_trades_limit, max(1, candidate_trades))
+    risk_budget = daily_budget * budget_fraction
+
+    for max_trades in range(candidate_trades, 0, -1):
+        minimum_stress = replay_historical_grid(
+            bars=bars,
+            point_size=point_size,
+            point_value_per_lot=point_value_per_lot,
+            step_value=step_value,
+            step_is_percentage=step_is_percentage,
+            initial_lot=minimum_lot,
+            max_trades=max_trades,
+            multiplier=ONE,
+            daily_budget=daily_budget,
+            budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
+            is_long=is_long,
+        )
+        if minimum_stress.estimated_loss > risk_budget:
+            continue
+        unit_stress = replay_historical_grid(
+            bars=bars,
+            point_size=point_size,
+            point_value_per_lot=point_value_per_lot,
+            step_value=step_value,
+            step_is_percentage=step_is_percentage,
+            initial_lot=ONE,
+            max_trades=max_trades,
+            multiplier=ONE,
+            daily_budget=daily_budget,
+            budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
+            is_long=is_long,
+        )
+        initial_lot = (
+            (unit_stress.recommended_max_lot / lot_step)
+            .to_integral_value(rounding=ROUND_FLOOR)
+            * lot_step
+        )
+        if maximum_lot is not None:
+            initial_lot = min(
+                initial_lot,
+                (maximum_lot / lot_step).to_integral_value(rounding=ROUND_FLOOR)
+                * lot_step,
+            )
+        if initial_lot < minimum_lot:
+            continue
+        selected = replay_historical_grid(
+            bars=bars,
+            point_size=point_size,
+            point_value_per_lot=point_value_per_lot,
+            step_value=step_value,
+            step_is_percentage=step_is_percentage,
+            initial_lot=initial_lot,
+            max_trades=max_trades,
+            multiplier=ONE,
+            daily_budget=daily_budget,
+            budget_fraction=budget_fraction,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+            commission_per_lot=commission_per_lot,
+            is_long=is_long,
+        )
+        if selected.estimated_loss <= risk_budget:
+            return GridSettingsSuggestion(
+                max_trades=max_trades,
+                initial_lot=initial_lot,
+                estimated_loss=selected.estimated_loss,
+                loss_budget=risk_budget,
+                stress_points=selected.stress_points,
+                step_points=selected.step_points,
+                worst_date=selected.worst_date,
+            )
+
+    minimum_stress = replay_historical_grid(
+        bars=bars,
+        point_size=point_size,
+        point_value_per_lot=point_value_per_lot,
+        step_value=step_value,
+        step_is_percentage=step_is_percentage,
+        initial_lot=minimum_lot,
+        max_trades=1,
+        multiplier=ONE,
+        daily_budget=daily_budget,
+        budget_fraction=budget_fraction,
+        spread_points=spread_points,
+        slippage_points=slippage_points,
+        commission_per_lot=commission_per_lot,
+        is_long=is_long,
+    )
+    raise ValueError(
+        "No safe setting fits the broker's minimum lot, even with Max Trades = 1: "
+        f"modeled loss {minimum_stress.estimated_loss} exceeds the risk allowance "
+        f"{risk_budget}."
     )
 
 

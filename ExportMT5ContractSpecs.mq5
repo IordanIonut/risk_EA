@@ -20,6 +20,7 @@ void OnStart()
              "points_per_ea_pip",
              "lot_step",
              "min_lot",
+             "max_lot",
              "account_currency",
              "profit_currency");
 
@@ -34,9 +35,10 @@ void OnStart()
       double tick_value=SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_VALUE);
       double lot_step=SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
       double min_lot=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
+      double max_lot=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MAX);
 
       if(point_size<=0.0 || tick_size<=0.0 || tick_value<=0.0 ||
-         lot_step<=0.0 || min_lot<=0.0)
+         lot_step<=0.0 || min_lot<=0.0 || max_lot<min_lot)
         {
          Print("Skipped ",symbol,
                ": broker did not provide valid point/tick/volume properties.");
@@ -56,6 +58,7 @@ void OnStart()
                 "",
                 DoubleToString(lot_step,8),
                 DoubleToString(min_lot,8),
+                DoubleToString(max_lot,8),
                 account_currency,
                 profit_currency);
       exported++;

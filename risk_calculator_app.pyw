@@ -1,4 +1,4 @@
-"""Desktop MT5 risk planner with Yahoo Finance quotes and daily history."""
+"""Desktop MT5 risk planner with broker CSV history and Yahoo fallback."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+import io
 import json
 import os
 import queue
@@ -26,11 +27,14 @@ from risk_calculator import (
     ONE,
     ONE_HUNDRED,
     ZERO,
+    backtest_historical_grid_campaign,
     calculate_historical_stress,
     calculate_grid_stress,
     calculate_portfolio,
     effective_portfolio_risk_cap,
+    replay_historical_grid,
     suggest_safe_grid_settings,
+    suggest_safe_grid_settings_from_history,
 )
 
 
@@ -165,7 +169,55 @@ YAHOO_ALIASES = {
 
 QuoteData = tuple[Decimal, str, str, str]
 ContractFields = dict[str, str]
-HISTORICAL_STRESS_MODE = "Yahoo 5-year max daily range"
+HISTORICAL_STRESS_MODE = "Historical max daily range (MT5 / Yahoo fallback)"
+HISTORICAL_DRAWDOWN_MODE = "Historical peak-to-trough drawdown (MT5 / Yahoo fallback)"
+HISTORICAL_STRESS_MODES = (
+    HISTORICAL_STRESS_MODE,
+    HISTORICAL_DRAWDOWN_MODE,
+)
+LEGACY_HISTORICAL_STRESS_MODE = "Yahoo 5-year max daily range"
+
+
+def historical_stress_move(
+    stress: HistoricalStress,
+    mode: str,
+    is_long: bool,
+) -> Decimal:
+    if mode == HISTORICAL_DRAWDOWN_MODE:
+        return stress.long_drawdown_pct if is_long else stress.short_rally_pct
+    return stress.long_adverse_pct if is_long else stress.short_adverse_pct
+
+
+def historical_stress_period(
+    stress: HistoricalStress,
+    mode: str,
+    is_long: bool,
+) -> str:
+    if mode == HISTORICAL_DRAWDOWN_MODE:
+        start_date, end_date = (
+            (stress.long_drawdown_peak_date, stress.long_drawdown_trough_date)
+            if is_long
+            else (stress.short_rally_trough_date, stress.short_rally_peak_date)
+        )
+        return f"{start_date} to {end_date}" if start_date and end_date else ""
+    return stress.long_observed_date if is_long else stress.short_observed_date
+
+
+def historical_spread_floor(
+    bars: tuple[DailyBar, ...],
+    configured_spread_points: Decimal,
+) -> Decimal:
+    return max(
+        configured_spread_points,
+        max(
+            (
+                bar.spread_points
+                for bar in bars
+                if bar.spread_points is not None
+            ),
+            default=ZERO,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -353,6 +405,298 @@ def fetch_yahoo_historical_stress(symbol: str) -> HistoricalStress:
     return calculate_historical_stress(bars)
 
 
+def parse_mt5_history_csv(
+    csv_text: str,
+    default_symbol: str = "",
+) -> dict[str, tuple[DailyBar, ...]]:
+    """Parse MT5 OHLC CSV and aggregate intraday rows into daily bars."""
+    reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")))
+    if not reader.fieldnames:
+        raise ValueError("The MT5 history CSV is empty or has no header row.")
+
+    def normalized_header(value: str) -> str:
+        return value.strip().strip("<>").strip().lower()
+
+    header_map = {
+        normalized_header(name): name
+        for name in reader.fieldnames
+        if name is not None
+    }
+    required = ("date", "high", "low", "close")
+    missing = [name for name in required if name not in header_map]
+    if missing:
+        raise ValueError(
+            "MT5 history CSV is missing required columns: " + ", ".join(missing)
+        )
+    if "symbol" not in header_map and not default_symbol.strip():
+        raise ValueError(
+            "MT5 history CSV needs a symbol column unless exactly one allocation "
+            "is available."
+        )
+
+    def parse_timestamp(date_text: str, time_text: str) -> datetime:
+        clean_date = date_text.strip()
+        clean_time = time_text.strip()
+        if clean_date.endswith("Z"):
+            clean_date = clean_date[:-1]
+        clean_date = clean_date.replace(".", "-")
+        combined = f"{clean_date} {clean_time}".strip()
+        for candidate in (combined, clean_date):
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(combined, pattern)
+            except ValueError:
+                continue
+        raise ValueError(f"Invalid MT5 date/time value: {combined}")
+
+    grouped: dict[
+        str,
+        dict[
+            str,
+            tuple[
+                datetime,
+                Decimal,
+                Decimal,
+                Decimal,
+                Decimal | None,
+                int | None,
+            ],
+        ],
+    ] = {}
+    row_count = 0
+    for line_number, row in enumerate(reader, start=2):
+        row_count += 1
+        if None in row:
+            raise ValueError(f"MT5 history CSV row {line_number} has too many columns.")
+        raw_symbol = (
+            row.get(header_map["symbol"], "").strip()
+            if "symbol" in header_map
+            else default_symbol.strip()
+        )
+        if not raw_symbol:
+            raise ValueError(f"MT5 history CSV row {line_number} has no symbol.")
+        raw_date = row.get(header_map["date"], "")
+        raw_time = row.get(header_map["time"], "") if "time" in header_map else ""
+        try:
+            timestamp = parse_timestamp(raw_date, raw_time)
+            high = decimal_value(row.get(header_map["high"], ""), "MT5 bar high")
+            low = decimal_value(row.get(header_map["low"], ""), "MT5 bar low")
+            close = decimal_value(row.get(header_map["close"], ""), "MT5 bar close")
+            spread_header = next(
+                (
+                    header_map[name]
+                    for name in (
+                        "spread_max_points",
+                        "max_spread_points",
+                        "spread_points",
+                        "spread",
+                    )
+                    if name in header_map
+                ),
+                None,
+            )
+            spread_text = row.get(spread_header, "").strip() if spread_header else ""
+            spread = (
+                decimal_value(spread_text, "MT5 bar spread")
+                if spread_text
+                else None
+            )
+            sample_count_text = (
+                row.get(header_map["spread_sample_count"], "").strip()
+                if "spread_sample_count" in header_map
+                else ""
+            )
+            try:
+                sample_count = (
+                    int(sample_count_text) if sample_count_text else None
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "MT5 bar spread sample count must be a whole number."
+                ) from error
+            if sample_count is not None and sample_count < 0:
+                raise ValueError("MT5 bar spread sample count must be non-negative.")
+        except ValueError as error:
+            raise ValueError(f"MT5 history CSV row {line_number}: {error}") from error
+        if min(high, low, close) <= ZERO or high < low:
+            raise ValueError(
+                f"MT5 history CSV row {line_number} contains invalid OHLC prices."
+            )
+        if spread is not None and spread < ZERO:
+            raise ValueError(
+                f"MT5 history CSV row {line_number} contains a negative spread."
+            )
+        symbol_key = raw_symbol.strip().upper()
+        day = timestamp.date().isoformat()
+        daily_rows = grouped.setdefault(symbol_key, {})
+        previous = daily_rows.get(day)
+        if previous is None:
+            daily_rows[day] = (
+                timestamp,
+                high,
+                low,
+                close,
+                spread,
+                sample_count,
+            )
+        else:
+            spreads = tuple(
+                value for value in (spread, previous[4]) if value is not None
+            )
+            sample_counts = tuple(
+                value
+                for value in (sample_count, previous[5])
+                if value is not None
+            )
+            daily_rows[day] = (
+                max(timestamp, previous[0]),
+                max(high, previous[1]),
+                min(low, previous[2]),
+                close if timestamp >= previous[0] else previous[3],
+                max(spreads) if spreads else None,
+                sum(sample_counts) if sample_counts else None,
+            )
+
+    if row_count == 0:
+        raise ValueError("The MT5 history CSV has no OHLC data rows.")
+
+    histories: dict[str, tuple[DailyBar, ...]] = {}
+    for symbol, daily_rows in grouped.items():
+        bars = tuple(
+            DailyBar(
+                date,
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+            )
+            for date, values in sorted(daily_rows.items())
+        )
+        calculate_historical_stress(bars)
+        histories[symbol] = bars
+    return histories
+
+
+def build_mt5_set_template(robot: str, settings: dict[str, str]) -> str:
+    """Create a .set draft using canonical names; EA input identifiers need verification."""
+    robot_type = robot.strip().upper()
+    if robot_type not in ("DCA", "RSI"):
+        raise ValueError("Robot type must be DCA or RSI.")
+    fields = {
+        "Magic Number": "MagicNumber",
+        "Max Trades": "MaxTrades",
+        "Step Type": "StepType",
+        "Step Value": "StepValue",
+        "Take Profit Type": "TakeProfitType",
+        "Take Profit Value": "TakeProfitValue",
+        "Risk Type": "RiskType",
+        "Risk": "Risk",
+        "Multiplier Factor": "MultiplierFactor",
+    }
+    enum_values = {
+        "Step Type": {
+            "Enum_percentage_pips": "0",
+            "enum_fixed_pips": "1",
+        },
+        "Take Profit Type": {
+            "Enum_percentage_pips": "0",
+            "enum_fixed_pips": "1",
+        },
+        "Risk Type": {"Fixed lots": "0"},
+    }
+    if robot_type == "DCA":
+        fields.update(
+            {
+                "Entry on price break": "EntryOnPriceBreak",
+                "InpPriceBreakType": "InpPriceBreakType",
+                "Reference Price": "ReferencePrice",
+                "Trade on new candle": "TradeOnNewCandle",
+                "Show Invested Money": "ShowInvestedMoney",
+            }
+        )
+        enum_values["InpPriceBreakType"] = {}
+        enum_values["InpPriceBreakType"] = {
+            "break Below": "0",
+            "break Above": "1",
+        }
+    else:
+        fields.update(
+            {
+                "Close When Overbought": "CloseWhenOverbought",
+                "RSI oversold": "RSIOversold",
+                "RSI Overbought": "RSIOverbought",
+                "RSI Period": "RSIPeriod",
+                "Show Invested Money": "ShowInvestedMoney",
+            }
+        )
+
+    integer_fields = {"Magic Number", "Max Trades"}
+    if robot_type == "RSI":
+        integer_fields.add("RSI Period")
+    decimal_fields = {
+        "Step Value",
+        "Take Profit Value",
+        "Risk",
+        "Multiplier Factor",
+    }
+    if robot_type == "DCA":
+        decimal_fields.add("Reference Price")
+    else:
+        decimal_fields.update({"RSI oversold", "RSI Overbought"})
+    boolean_fields = (
+        {
+            "Entry on price break",
+            "Trade on new candle",
+            "Show Invested Money",
+        }
+        if robot_type == "DCA"
+        else {"Close When Overbought", "Show Invested Money"}
+    )
+
+    lines = []
+    for label, name in fields.items():
+        if label not in settings:
+            raise ValueError(f"Generated settings are missing '{label}'.")
+        value = settings[label].strip()
+        if not value or "\n" in value or "\r" in value:
+            raise ValueError(f"Generated setting '{label}' is empty or invalid.")
+        if label in integer_fields:
+            positive_integer(value, label)
+            if label == "Magic Number" and int(value) > 2147483647:
+                raise ValueError("Magic Number must not exceed 2147483647.")
+        elif label in decimal_fields:
+            numeric_value = decimal_value(value, label)
+            if numeric_value < ZERO or (
+                numeric_value == ZERO and label != "Reference Price"
+            ):
+                raise ValueError(f"Generated setting '{label}' must be positive.")
+        elif label in boolean_fields and value not in ("true", "false"):
+            raise ValueError(f"Generated setting '{label}' must be true or false.")
+        choices = enum_values.get(label, {})
+        if choices:
+            if value not in choices:
+                raise ValueError(f"Unsupported {label} value: {value}")
+            value = choices[value]
+        lines.append(f"{name}={value}||0||0||0||N")
+    if robot_type == "DCA":
+        if settings["Entry on price break"] == "true":
+            if decimal_value(settings["Reference Price"], "Reference Price") <= ZERO:
+                raise ValueError("Reference Price must be positive when price-break entry is enabled.")
+        elif decimal_value(settings["Reference Price"], "Reference Price") != ZERO:
+            raise ValueError("Reference Price must be zero when price-break entry is disabled.")
+    else:
+        oversold = decimal_value(settings["RSI oversold"], "RSI oversold")
+        overbought = decimal_value(settings["RSI Overbought"], "RSI Overbought")
+        if not ZERO < oversold < overbought < Decimal("100"):
+            raise ValueError("RSI levels must satisfy 0 < oversold < overbought < 100.")
+    return "\r\n".join(lines) + "\r\n"
+
+
 class RiskCalculatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -365,6 +709,8 @@ class RiskCalculatorApp(tk.Tk):
         self.contract_inputs: dict[str, ContractFields] = {}
         self.quotes: dict[str, QuoteData] = {}
         self.historical_stresses: dict[str, HistoricalStress] = {}
+        self.history_bars: dict[str, tuple[DailyBar, ...]] = {}
+        self.history_sources: dict[str, str] = {}
         self.magic_assignments: dict[str, int] = {}
         self.quote_messages: queue.Queue[tuple[str, str, object]] = queue.Queue()
         self.quote_busy = False
@@ -400,7 +746,7 @@ class RiskCalculatorApp(tk.Tk):
         ).pack(side="left")
         ttk.Label(
             header,
-            text="Risk estimates using MT5 contracts and Yahoo 5-year history",
+            text="Risk estimates using MT5 contracts and broker history with Yahoo fallback",
         ).pack(side="right", anchor="e")
         scenario_buttons = ttk.Frame(header)
         scenario_buttons.pack(side="right", padx=(0, 16))
@@ -438,6 +784,9 @@ class RiskCalculatorApp(tk.Tk):
             "point_size": self.point_size_var,
             "points_per_pip": self.points_per_pip_var,
             "contract_currency": self.contract_currency_var,
+            "spread_points": self.spread_points_var,
+            "slippage_points": self.slippage_points_var,
+            "commission_per_lot": self.commission_per_lot_var,
             "stress_percent": self.stress_pct_var,
             "stress_mode": self.stress_mode_var,
             "stress_target_price": self.stress_target_price_var,
@@ -462,6 +811,8 @@ class RiskCalculatorApp(tk.Tk):
             "points_per_pip": self.points_per_pip_var,
             "lot_increment": self.lot_step_var,
             "minimum_lot": self.minimum_lot_var,
+            "maximum_lot": self.maximum_lot_var,
+            "commission_per_lot": self.symbol_commission_per_lot_var,
             "contract_currency": self.contract_currency_var,
         }
 
@@ -485,6 +836,12 @@ class RiskCalculatorApp(tk.Tk):
             "long_observed_date": stress.long_observed_date,
             "short_adverse_pct": str(stress.short_adverse_pct),
             "short_observed_date": stress.short_observed_date,
+            "long_drawdown_pct": str(stress.long_drawdown_pct),
+            "long_drawdown_peak_date": stress.long_drawdown_peak_date,
+            "long_drawdown_trough_date": stress.long_drawdown_trough_date,
+            "short_rally_pct": str(stress.short_rally_pct),
+            "short_rally_trough_date": stress.short_rally_trough_date,
+            "short_rally_peak_date": stress.short_rally_peak_date,
             "bar_count": stress.bar_count,
             "start_date": stress.start_date,
             "end_date": stress.end_date,
@@ -525,13 +882,33 @@ class RiskCalculatorApp(tk.Tk):
                     "historical_stress": self._historical_stress_data(
                         self.historical_stresses.get(row_id)
                     ),
+                    "history_source": self.history_sources.get(row_id, ""),
+                    "history_bars": [
+                        {
+                            "date": bar.date,
+                            "high": str(bar.high),
+                            "low": str(bar.low),
+                            "close": str(bar.close),
+                            "spread_points": (
+                                str(bar.spread_points)
+                                if bar.spread_points is not None
+                                else ""
+                            ),
+                            "spread_sample_count": (
+                                str(bar.spread_sample_count)
+                                if bar.spread_sample_count is not None
+                                else ""
+                            ),
+                        }
+                        for bar in self.history_bars.get(row_id, ())
+                    ],
                 }
             )
 
         selected_index = row_ids.index(selected_id) if selected_id in row_ids else None
         return {
             "format": "mt5-risk-planner-scenario",
-            "version": 6,
+            "version": 12,
             "portfolio": {
                 "account_capital": self.account_capital_var.get(),
                 "currency": self.currency_var.get(),
@@ -571,7 +948,7 @@ class RiskCalculatorApp(tk.Tk):
             data.get("format") != "mt5-risk-planner-scenario"
             or isinstance(version, bool)
             or not isinstance(version, int)
-            or version not in (1, 2, 3, 4, 5, 6)
+            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
         ):
             raise ValueError("Unsupported or unrecognized scenario file format.")
 
@@ -692,15 +1069,22 @@ class RiskCalculatorApp(tk.Tk):
                 "points_per_pip",
                 "lot_increment",
                 "minimum_lot",
+                "maximum_lot",
+                "commission_per_lot",
                 "contract_currency",
             )
             if version >= 3 and "broker_contract" not in raw:
                 raise ValueError(f"Allocation {position} is missing broker contract data.")
             normalized_contract = {
                 field: (
-                    required_text(raw_contract, field)
-                    if version >= 3
-                    else str(raw_contract.get(field, ""))
+                    ""
+                    if (field == "maximum_lot" and version < 10)
+                    or (field == "commission_per_lot" and version < 11)
+                    else (
+                        required_text(raw_contract, field)
+                        if version >= 3
+                        else str(raw_contract.get(field, ""))
+                    )
                 )
                 for field in contract_fields
             }
@@ -710,13 +1094,42 @@ class RiskCalculatorApp(tk.Tk):
                 "points_per_pip",
                 "lot_increment",
                 "minimum_lot",
+                "maximum_lot",
             ):
                 value = normalized_contract[field].strip()
-                if value and decimal_value(
-                    value, f"Allocation {position} broker {field}"
-                ) <= ZERO:
+                if value:
+                    parsed_value = decimal_value(
+                        value, f"Allocation {position} broker {field}"
+                    )
+                    if parsed_value <= ZERO:
+                        raise ValueError(
+                            f"Allocation {position} broker {field} must be positive."
+                        )
+            if (
+                normalized_contract["maximum_lot"].strip()
+                and normalized_contract["minimum_lot"].strip()
+                and decimal_value(
+                    normalized_contract["maximum_lot"],
+                    f"Allocation {position} broker maximum lot",
+                )
+                < decimal_value(
+                    normalized_contract["minimum_lot"],
+                    f"Allocation {position} broker minimum lot",
+                )
+            ):
+                raise ValueError(
+                    f"Allocation {position} broker maximum lot cannot be below "
+                    "the minimum lot."
+                )
+            contract_commission = normalized_contract["commission_per_lot"].strip()
+            if contract_commission:
+                if decimal_value(
+                    contract_commission,
+                    f"Allocation {position} broker commission per lot",
+                ) < ZERO:
                     raise ValueError(
-                        f"Allocation {position} broker {field} must be positive."
+                        f"Allocation {position} broker commission must be "
+                        "non-negative."
                     )
             historical_stress = None
             if version >= 4:
@@ -784,6 +1197,69 @@ class RiskCalculatorApp(tk.Tk):
                         raise ValueError(
                             f"Allocation {position} historical dates are inconsistent."
                         )
+                    drawdown_values: dict[str, str] = {}
+                    drawdown_date_pairs = (
+                        (
+                            "long_drawdown_pct",
+                            "long_drawdown_peak_date",
+                            "long_drawdown_trough_date",
+                        ),
+                        (
+                            "short_rally_pct",
+                            "short_rally_trough_date",
+                            "short_rally_peak_date",
+                        ),
+                    )
+                    for pct_key, start_key, end_key in drawdown_date_pairs:
+                        if version >= 8:
+                            pct_text = required_text(raw_stress, pct_key)
+                            start_text = required_text(raw_stress, start_key)
+                            end_text = required_text(raw_stress, end_key)
+                            pct_value = decimal_value(
+                                pct_text,
+                                f"Allocation {position} {pct_key.replace('_', ' ')}",
+                            )
+                            if pct_value < ZERO:
+                                raise ValueError(
+                                    f"Allocation {position} {pct_key.replace('_', ' ')} "
+                                    "must be non-negative."
+                                )
+                            if pct_value == ZERO:
+                                if start_text or end_text:
+                                    raise ValueError(
+                                        f"Allocation {position} {pct_key.replace('_', ' ')} "
+                                        "dates must be empty when the move is zero."
+                                    )
+                            else:
+                                try:
+                                    start_value = datetime.strptime(
+                                        start_text, "%Y-%m-%d"
+                                    ).date()
+                                    end_value = datetime.strptime(
+                                        end_text, "%Y-%m-%d"
+                                    ).date()
+                                except ValueError as error:
+                                    raise ValueError(
+                                        f"Allocation {position} has invalid "
+                                        f"{pct_key.replace('_', ' ')} dates."
+                                    ) from error
+                                if not (
+                                    parsed_dates["start_date"]
+                                    <= start_value
+                                    <= end_value
+                                    <= parsed_dates["end_date"]
+                                ):
+                                    raise ValueError(
+                                        f"Allocation {position} {pct_key.replace('_', ' ')} "
+                                        "dates are inconsistent."
+                                    )
+                            drawdown_values[pct_key] = str(pct_value)
+                            drawdown_values[start_key] = start_text
+                            drawdown_values[end_key] = end_text
+                        else:
+                            drawdown_values[pct_key] = "0"
+                            drawdown_values[start_key] = ""
+                            drawdown_values[end_key] = ""
                     historical_stress = {
                         "long_adverse_pct": str(
                             decimal_value(
@@ -799,10 +1275,152 @@ class RiskCalculatorApp(tk.Tk):
                             )
                         ),
                         "short_observed_date": stress_dates["short_observed_date"],
+                        **drawdown_values,
                         "bar_count": raw_count,
                         "start_date": stress_dates["start_date"],
                         "end_date": stress_dates["end_date"],
                     }
+            raw_bars = raw.get("history_bars", [])
+            history_bars: list[dict[str, str]] = []
+            if version >= 7:
+                if not isinstance(raw_bars, list) or len(raw_bars) > 10000:
+                    raise ValueError(
+                        f"Allocation {position} history_bars must be a list of at most 10000 bars."
+                    )
+                parsed_bars: list[DailyBar] = []
+                for bar_index, raw_bar in enumerate(raw_bars, start=1):
+                    if not isinstance(raw_bar, dict):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} must be an object."
+                        )
+                    bar_date = required_text(raw_bar, "date")
+                    try:
+                        datetime.strptime(bar_date, "%Y-%m-%d")
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} has an invalid date."
+                        ) from error
+                    raw_spread = raw_bar.get("spread_points", "")
+                    if not isinstance(raw_spread, str):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "spread must be text."
+                        )
+                    raw_sample_count = raw_bar.get("spread_sample_count", "")
+                    if version >= 12 and not isinstance(raw_sample_count, str):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "spread sample count must be text."
+                        )
+                    if not isinstance(raw_sample_count, str):
+                        raw_sample_count = ""
+                    try:
+                        spread_sample_count = (
+                            int(raw_sample_count) if raw_sample_count.strip() else None
+                        )
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "has an invalid spread sample count."
+                        ) from error
+                    if (
+                        spread_sample_count is not None
+                        and spread_sample_count < 0
+                    ):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "spread sample count must be non-negative."
+                        )
+                    parsed_bar = DailyBar(
+                        bar_date,
+                        decimal_value(
+                            required_text(raw_bar, "high"),
+                            f"Allocation {position} history high",
+                        ),
+                        decimal_value(
+                            required_text(raw_bar, "low"),
+                            f"Allocation {position} history low",
+                        ),
+                        decimal_value(
+                            required_text(raw_bar, "close"),
+                            f"Allocation {position} history close",
+                        ),
+                        decimal_value(
+                            raw_spread,
+                            f"Allocation {position} history spread",
+                        )
+                        if raw_spread.strip()
+                        else None,
+                        spread_sample_count,
+                    )
+                    if (
+                        parsed_bar.spread_points is not None
+                        and parsed_bar.spread_points < ZERO
+                    ):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "spread must be non-negative."
+                        )
+                    parsed_bars.append(parsed_bar)
+                    history_bars.append(
+                        {
+                            "date": parsed_bar.date,
+                            "high": str(parsed_bar.high),
+                            "low": str(parsed_bar.low),
+                            "close": str(parsed_bar.close),
+                            "spread_points": (
+                                str(parsed_bar.spread_points)
+                                if parsed_bar.spread_points is not None
+                                else ""
+                            ),
+                            "spread_sample_count": (
+                                str(parsed_bar.spread_sample_count)
+                                if parsed_bar.spread_sample_count is not None
+                                else ""
+                            ),
+                        }
+                    )
+                history_source = required_text(raw, "history_source")
+                if history_source not in ("", "Yahoo", "MT5 CSV"):
+                    raise ValueError(
+                        f"Allocation {position} has an unsupported history source."
+                    )
+                if parsed_bars:
+                    computed_stress = calculate_historical_stress(parsed_bars)
+                    if historical_stress is None or history_source != "MT5 CSV":
+                        raise ValueError(
+                            f"Allocation {position} MT5 history bars need matching historical stress data."
+                        )
+                    historical_stress.update(
+                        {
+                            "long_drawdown_pct": str(
+                                computed_stress.long_drawdown_pct
+                            ),
+                            "long_drawdown_peak_date": (
+                                computed_stress.long_drawdown_peak_date
+                            ),
+                            "long_drawdown_trough_date": (
+                                computed_stress.long_drawdown_trough_date
+                            ),
+                            "short_rally_pct": str(computed_stress.short_rally_pct),
+                            "short_rally_trough_date": (
+                                computed_stress.short_rally_trough_date
+                            ),
+                            "short_rally_peak_date": (
+                                computed_stress.short_rally_peak_date
+                            ),
+                        }
+                    )
+                    if normalized_quote is None:
+                        raise ValueError(
+                            f"Allocation {position} MT5 history needs a saved reference quote."
+                        )
+                if history_source == "MT5 CSV" and not parsed_bars:
+                    raise ValueError(
+                        f"Allocation {position} is marked MT5 CSV without stored bars."
+                    )
+            else:
+                history_source = "Yahoo" if historical_stress is not None else ""
             normalized_allocations.append(
                 {
                     "symbol": symbol,
@@ -813,6 +1431,8 @@ class RiskCalculatorApp(tk.Tk):
                     "broker_contract": normalized_contract,
                     "quote": normalized_quote,
                     "historical_stress": historical_stress,
+                    "history_source": history_source,
+                    "history_bars": history_bars,
                 }
             )
 
@@ -825,6 +1445,12 @@ class RiskCalculatorApp(tk.Tk):
             text_settings.setdefault("position_direction", "Long (price falls)")
         if version < 3:
             text_settings.setdefault("contract_currency", "")
+        if text_settings.get("stress_mode") == LEGACY_HISTORICAL_STRESS_MODE:
+            text_settings["stress_mode"] = HISTORICAL_STRESS_MODE
+        if version < 7:
+            text_settings.setdefault("spread_points", "0")
+            text_settings.setdefault("slippage_points", "0")
+            text_settings.setdefault("commission_per_lot", "0")
         string_keys = (
             "magic_number",
             "step_type",
@@ -841,6 +1467,9 @@ class RiskCalculatorApp(tk.Tk):
             "minimum_lot",
             "compare_trades",
             "selected_trades",
+            "spread_points",
+            "slippage_points",
+            "commission_per_lot",
             "take_profit_type",
             "take_profit_value",
             "price_break_type",
@@ -859,6 +1488,20 @@ class RiskCalculatorApp(tk.Tk):
         clean_text = {
             key: required_text(text_settings, key) for key in string_keys
         }
+        for cost_field in (
+            "spread_points",
+            "slippage_points",
+            "commission_per_lot",
+        ):
+            if version < 7:
+                clean_text[cost_field] = "0"
+            cost_text = clean_text[cost_field].strip()
+            if cost_text and decimal_value(
+                cost_text, f"Scenario {cost_field.replace('_', ' ')}"
+            ) < ZERO:
+                raise ValueError(
+                    f"Scenario {cost_field.replace('_', ' ')} must be non-negative."
+                )
         clean_options = {}
         for key in bool_keys:
             value = option_settings.get(key)
@@ -875,8 +1518,12 @@ class RiskCalculatorApp(tk.Tk):
             "Target price",
             "Adverse move (%)",
             HISTORICAL_STRESS_MODE,
+            HISTORICAL_DRAWDOWN_MODE,
+            LEGACY_HISTORICAL_STRESS_MODE,
         ):
             raise ValueError("Scenario has an invalid stress-test mode.")
+        if clean_text["stress_mode"] == LEGACY_HISTORICAL_STRESS_MODE:
+            clean_text["stress_mode"] = HISTORICAL_STRESS_MODE
         if clean_text["position_direction"] not in (
             "Long (price falls)",
             "Short (price rises)",
@@ -1011,6 +1658,8 @@ class RiskCalculatorApp(tk.Tk):
         self.allocation_results.clear()
         self.quotes.clear()
         self.historical_stresses.clear()
+        self.history_bars.clear()
+        self.history_sources.clear()
         self.magic_assignments.clear()
         self.contract_inputs.clear()
         self.saved_quote_rows.clear()
@@ -1018,6 +1667,8 @@ class RiskCalculatorApp(tk.Tk):
         self.current_settings_row = None
         contracts_to_restore: dict[str, ContractFields] = {}
         history_to_restore: dict[str, HistoricalStress] = {}
+        bars_to_restore: dict[str, tuple[DailyBar, ...]] = {}
+        sources_to_restore: dict[str, str] = {}
         for item in raw_allocations:
             assert isinstance(item, dict)
             self._insert_allocation(
@@ -1038,7 +1689,46 @@ class RiskCalculatorApp(tk.Tk):
                     bar_count=history_data["bar_count"],
                     start_date=history_data["start_date"],
                     end_date=history_data["end_date"],
+                    long_drawdown_pct=Decimal(
+                        history_data.get("long_drawdown_pct", "0")
+                    ),
+                    long_drawdown_peak_date=history_data.get(
+                        "long_drawdown_peak_date", ""
+                    ),
+                    long_drawdown_trough_date=history_data.get(
+                        "long_drawdown_trough_date", ""
+                    ),
+                    short_rally_pct=Decimal(history_data.get("short_rally_pct", "0")),
+                    short_rally_trough_date=history_data.get(
+                        "short_rally_trough_date", ""
+                    ),
+                    short_rally_peak_date=history_data.get(
+                        "short_rally_peak_date", ""
+                    ),
                 )
+            raw_history_bars = item["history_bars"]
+            if raw_history_bars:
+                bars_to_restore[row_id] = tuple(
+                    DailyBar(
+                        bar["date"],
+                        Decimal(bar["high"]),
+                        Decimal(bar["low"]),
+                        Decimal(bar["close"]),
+                        (
+                            Decimal(bar["spread_points"])
+                            if bar.get("spread_points")
+                            else None
+                        ),
+                        (
+                            int(bar["spread_sample_count"])
+                            if bar.get("spread_sample_count")
+                            else None
+                        ),
+                    )
+                    for bar in raw_history_bars
+                )
+            if item["history_source"]:
+                sources_to_restore[row_id] = item["history_source"]
             magic_number = item["magic_number"]
             if magic_number is not None:
                 self.magic_assignments[row_id] = magic_number
@@ -1060,6 +1750,8 @@ class RiskCalculatorApp(tk.Tk):
 
         self.contract_inputs.update(contracts_to_restore)
         self.historical_stresses.update(history_to_restore)
+        self.history_bars.update(bars_to_restore)
+        self.history_sources.update(sources_to_restore)
         self.saved_history_rows.update(history_to_restore)
         self.current_settings_row = None
         self.allocation_results.clear()
@@ -1216,7 +1908,7 @@ class RiskCalculatorApp(tk.Tk):
             "ticker": "Yahoo ticker",
             "robot": "Robot",
             "capital": "Capital",
-            "quote": "Yahoo reference price",
+            "quote": "Market reference price",
             "daily": "Daily risk budget",
         }
         widths = {
@@ -1263,6 +1955,11 @@ class RiskCalculatorApp(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Button(
             actions,
+            text="Import MT5 OHLC history CSV",
+            command=self._import_mt5_history,
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            actions,
             text="Calculate portfolio budgets",
             command=self._calculate_portfolio,
         ).pack(side="right")
@@ -1281,11 +1978,15 @@ class RiskCalculatorApp(tk.Tk):
             text=(
                 "MT5 CSV headers: symbol, point_size, "
                 "point_value_per_point_per_lot (in account currency), "
-                "account_currency, points_per_ea_pip, lot_step, min_lot. "
-                "Fetch 5-year daily history to size fixed lots against each "
-                "symbol's largest observed adverse daily range. Legacy "
+                "account_currency, points_per_ea_pip, lot_step, min_lot, "
+                "optional max_lot. "
+                "Fetch daily history to size fixed lots against each symbol's "
+                "largest peak-to-trough decline; daily shock remains available "
+                "as a separate stress mode. Legacy "
                 "profit_currency headers are accepted cautiously. "
-                "You can create it with ExportMT5ContractSpecs.mq5 in MT5."
+                "Create it with ExportMT5ContractSpecs.mq5. For broker OHLC "
+                "history use ExportMT5History.mq5; MT5 history is preferred "
+                "for the imported symbol and Yahoo remains the fallback."
             ),
             wraplength=1080,
         ).pack(fill="x", pady=(3, 0))
@@ -1293,7 +1994,7 @@ class RiskCalculatorApp(tk.Tk):
     def _build_settings_tab(self) -> None:
         top = ttk.LabelFrame(
             self.settings_tab,
-            text="Select robot and Yahoo reference price",
+            text="Select robot and market reference price",
             style="Section.TLabelframe",
             padding=9,
         )
@@ -1383,12 +2084,17 @@ class RiskCalculatorApp(tk.Tk):
         self.step_type_var = tk.StringVar(value="Percentage")
         self.step_value_var = tk.StringVar(value="0.5")
         self.stress_pct_var = tk.StringVar(value="1")
-        self.stress_mode_var = tk.StringVar(value=HISTORICAL_STRESS_MODE)
+        self.stress_mode_var = tk.StringVar(value=HISTORICAL_DRAWDOWN_MODE)
         self.stress_target_price_var = tk.StringVar()
         self.position_direction_var = tk.StringVar(value="Long (price falls)")
         self.stress_pct_var.trace_add("write", self._stress_percent_changed)
         self.lot_step_var = tk.StringVar()
         self.minimum_lot_var = tk.StringVar()
+        self.maximum_lot_var = tk.StringVar()
+        self.symbol_commission_per_lot_var = tk.StringVar()
+        self.spread_points_var = tk.StringVar(value="0")
+        self.slippage_points_var = tk.StringVar(value="0")
+        self.commission_per_lot_var = tk.StringVar(value="0")
         self.compare_trades_var = tk.StringVar(value="10")
         self.selected_trades_var = tk.StringVar(value="3")
 
@@ -1412,6 +2118,7 @@ class RiskCalculatorApp(tk.Tk):
                 "Target price",
                 "Adverse move (%)",
                 HISTORICAL_STRESS_MODE,
+                HISTORICAL_DRAWDOWN_MODE,
             ),
             state="readonly",
             width=33,
@@ -1450,14 +2157,43 @@ class RiskCalculatorApp(tk.Tk):
         )
         self._add_entry(market, 9, "Broker lot increment (e.g. 0.01)", self.lot_step_var, 35)
         self._add_entry(market, 10, "Broker minimum lot (e.g. 0.01)", self.minimum_lot_var, 35)
-        self._add_entry(market, 11, "Max Trades candidates to compare (1-20)", self.compare_trades_var, 35)
-        self._add_entry(market, 12, "Max Trades to output", self.selected_trades_var, 35)
+        self._add_entry(market, 11, "Broker maximum lot per order (optional)", self.maximum_lot_var, 35)
+        self._add_entry(market, 12, "Max Trades candidates to compare (1-20)", self.compare_trades_var, 35)
+        self._add_entry(market, 13, "Max Trades to output", self.selected_trades_var, 35)
         ttk.Label(market, text="Point-value currency (account currency)").grid(
-            row=13, column=0, sticky="w", pady=3
+            row=14, column=0, sticky="w", pady=3
         )
         ttk.Entry(
             market, textvariable=self.contract_currency_var, width=35, state="readonly"
-        ).grid(row=13, column=1, sticky="ew", pady=3)
+        ).grid(row=14, column=1, sticky="ew", pady=3)
+        self._add_entry(
+            market,
+            15,
+            "Minimum spread (MT5 points)",
+            self.spread_points_var,
+            35,
+        )
+        self._add_entry(
+            market,
+            16,
+            "Slippage allowance (MT5 points per trade)",
+            self.slippage_points_var,
+            35,
+        )
+        self._add_entry(
+            market,
+            17,
+            "Fallback round-turn commission per 1.00 lot",
+            self.commission_per_lot_var,
+            35,
+        )
+        self._add_entry(
+            market,
+            18,
+            "Symbol override commission per 1.00 lot (optional)",
+            self.symbol_commission_per_lot_var,
+            35,
+        )
 
         ea = ttk.LabelFrame(
             controls,
@@ -1562,7 +2298,7 @@ class RiskCalculatorApp(tk.Tk):
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(
             buttons,
-            text="Suggest all robots (price fall)",
+            text="Suggest all robots (historical drawdown)",
             command=self._suggest_portfolio_downside,
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
@@ -1572,6 +2308,11 @@ class RiskCalculatorApp(tk.Tk):
         ).pack(side="right")
         ttk.Button(
             buttons, text="Copy output", command=self._copy_output
+        ).pack(side="right", padx=8)
+        ttk.Button(
+            buttons,
+            text="Export .set template",
+            command=self._export_set_template,
         ).pack(side="right", padx=8)
         ttk.Label(
             buttons,
@@ -1672,6 +2413,8 @@ class RiskCalculatorApp(tk.Tk):
         self.allocation_results.clear()
         self.quotes.pop(row_id, None)
         self.historical_stresses.pop(row_id, None)
+        self.history_bars.pop(row_id, None)
+        self.history_sources.pop(row_id, None)
         self.magic_assignments.pop(row_id, None)
         self.contract_inputs.pop(row_id, None)
         self.saved_quote_rows.discard(row_id)
@@ -1758,6 +2501,12 @@ class RiskCalculatorApp(tk.Tk):
                 "points_per_pip": ("pointspereapip", "pointsperpip"),
                 "lot_increment": ("lotstep", "volumestep"),
                 "minimum_lot": ("minlot", "volumemin"),
+                "maximum_lot": ("maxlot", "volumemax"),
+                "commission_per_lot": (
+                    "commissionperlot",
+                    "roundturncommissionperlot",
+                    "commissionperlotaccountcurrency",
+                ),
                 "contract_currency": (
                     "accountcurrency",
                     "pointvaluecurrency",
@@ -1828,7 +2577,34 @@ class RiskCalculatorApp(tk.Tk):
                             f"CSV row {line_number} points_per_pip must be positive."
                         )
                     contract["points_per_pip"] = format_decimal(points_per_pip)
+                if contract.get("maximum_lot"):
+                    maximum_lot = decimal_value(
+                        contract["maximum_lot"],
+                        f"CSV row {line_number} maximum_lot",
+                    )
+                    if maximum_lot < decimal_value(
+                        contract["minimum_lot"],
+                        f"CSV row {line_number} minimum_lot",
+                    ):
+                        raise ValueError(
+                            f"CSV row {line_number} maximum_lot cannot be below "
+                            "minimum_lot."
+                        )
+                    contract["maximum_lot"] = format_decimal(maximum_lot)
+                if contract.get("commission_per_lot"):
+                    commission = decimal_value(
+                        contract["commission_per_lot"],
+                        f"CSV row {line_number} commission_per_lot",
+                    )
+                    if commission < ZERO:
+                        raise ValueError(
+                            f"CSV row {line_number} commission_per_lot must be "
+                            "non-negative."
+                        )
+                    contract["commission_per_lot"] = format_decimal(commission)
                 contract.setdefault("points_per_pip", "")
+                contract.setdefault("maximum_lot", "")
+                contract.setdefault("commission_per_lot", "")
                 contract.setdefault("contract_currency", "")
                 contracts[key] = contract
 
@@ -1848,10 +2624,35 @@ class RiskCalculatorApp(tk.Tk):
         contract = dict(self.contract_inputs.get(row_id, {}))
         if row_id == self.current_settings_row:
             for key, variable in self._contract_input_variables().items():
-                value = variable.get().strip()
-                if value:
-                    contract[key] = value
+                contract[key] = variable.get().strip()
         return contract
+
+    def _transaction_costs(
+        self,
+        contract: ContractFields | None = None,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        costs = []
+        for variable, label in (
+            (self.spread_points_var, "Minimum spread points"),
+            (self.slippage_points_var, "Slippage points"),
+            (self.commission_per_lot_var, "Round-turn commission per lot"),
+        ):
+            raw = variable.get().strip()
+            value = ZERO if not raw else decimal_value(raw, label)
+            if value < ZERO:
+                raise ValueError(f"{label} must be non-negative.")
+            costs.append(value)
+        override_text = (contract or {}).get("commission_per_lot", "").strip()
+        if override_text:
+            override = decimal_value(
+                override_text, "Symbol round-turn commission per lot"
+            )
+            if override < ZERO:
+                raise ValueError(
+                    "Symbol round-turn commission per lot must be non-negative."
+                )
+            costs[2] = override
+        return costs[0], costs[1], costs[2]
 
     def _load_contract_inputs(self, row_id: str) -> None:
         fields = self.contract_inputs.get(row_id, {})
@@ -1916,6 +2717,88 @@ class RiskCalculatorApp(tk.Tk):
             self.status_var.set("MT5 contract import failed.")
             messagebox.showerror("Could not import MT5 data", str(error), parent=self)
 
+    def _import_mt5_history(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Import MT5 OHLC history",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            default_symbol = (
+                next(iter(self.allocations.values())).index
+                if len(self.allocations) == 1
+                else ""
+            )
+            with open(path, "r", encoding="utf-8-sig", newline="") as history_file:
+                histories = parse_mt5_history_csv(
+                    history_file.read(),
+                    default_symbol=default_symbol,
+                )
+            matched = 0
+            unmatched: list[str] = []
+            for row_id, allocation in self.allocations.items():
+                symbol_key = allocation.index.strip().upper()
+                bars = histories.get(symbol_key)
+                if bars is None:
+                    base_key = self._broker_symbol_base(allocation.index)
+                    candidates = [
+                        candidate_bars
+                        for symbol, candidate_bars in histories.items()
+                        if self._broker_symbol_base(symbol) == base_key
+                    ]
+                    if len(candidates) == 1:
+                        bars = candidates[0]
+                    elif len(candidates) > 1:
+                        unmatched.append(f"{allocation.index} (ambiguous symbol match)")
+                        continue
+                if bars is None:
+                    unmatched.append(allocation.index)
+                    continue
+                history = calculate_historical_stress(bars)
+                self.historical_stresses[row_id] = history
+                self.history_bars[row_id] = bars
+                self.history_sources[row_id] = "MT5 CSV"
+                self.saved_history_rows.discard(row_id)
+                last_bar = bars[-1]
+                self.quotes[row_id] = (
+                    last_bar.close,
+                    "MT5 price",
+                    allocation.index,
+                    f"{last_bar.date} (last imported bar)",
+                )
+                self.saved_quote_rows.discard(row_id)
+                values = list(self.allocation_tree.item(row_id, "values"))
+                values[4] = f"{format_decimal(last_bar.close)} (MT5 history)"
+                self.allocation_tree.item(row_id, values=values)
+                matched += 1
+
+            if matched == 0:
+                raise ValueError(
+                    "No imported MT5 history symbol matched the current portfolio. "
+                    "Check the CSV symbol column or add a single allocation before "
+                    "importing a file without one."
+                )
+            self._calculate_portfolio(show_error=False)
+            self._selection_changed()
+            self._update_stress_input_states()
+            self.status_var.set(
+                f"Imported {matched} MT5 OHLC history allocation(s) from {path}."
+            )
+            if unmatched:
+                messagebox.showwarning(
+                    "Some histories were not matched",
+                    f"Imported {matched} symbol(s). Add or correct history for: "
+                    + ", ".join(unmatched),
+                    parent=self,
+                )
+        except (OSError, UnicodeError, csv.Error, ValueError) as error:
+            self.status_var.set("MT5 history import failed.")
+            messagebox.showerror(
+                "Could not import MT5 history", str(error), parent=self
+            )
+
     def _main_tab_changed(self, _event: object = None) -> None:
         if self.notebook.select() != str(self.settings_tab):
             return
@@ -1939,9 +2822,9 @@ class RiskCalculatorApp(tk.Tk):
                 self._show_settings_hint(
                     f"Scenario loaded for {self.allocations[row_id].index} / "
                     f"{self.allocations[row_id].robot}.\n\n"
-                    "Import the MT5 contract CSV and fetch Yahoo price plus "
-                    "5-year daily history. Set a strategy-specific Take Profit "
-                    "value if you want a complete EA configuration."
+                    "Import the MT5 contract CSV and optional MT5 OHLC history, "
+                    "or fetch Yahoo price plus daily history. Set a strategy-specific "
+                    "Take Profit value for a complete EA configuration."
                 )
 
     def _show_settings_hint(self, text: str) -> None:
@@ -1978,7 +2861,7 @@ class RiskCalculatorApp(tk.Tk):
         if not hasattr(self, "stress_target_entry"):
             return
         mode = self.stress_mode_var.get()
-        if mode == HISTORICAL_STRESS_MODE:
+        if mode in HISTORICAL_STRESS_MODES:
             self.stress_target_entry.configure(state="readonly")
             self.stress_percent_entry.configure(state="readonly")
             self.target_suggestion_button.configure(state="disabled")
@@ -1989,12 +2872,14 @@ class RiskCalculatorApp(tk.Tk):
             if historical is None:
                 self.stress_pct_var.set("")
                 return
-            stress_percent = (
-                historical.short_adverse_pct
-                if self.position_direction_var.get() == "Short (price rises)"
-                else historical.long_adverse_pct
+            stress_percent = historical_stress_move(
+                historical,
+                mode,
+                self.position_direction_var.get() != "Short (price rises)",
             )
-            self.stress_pct_var.set(format_decimal(stress_percent))
+            self.stress_pct_var.set(
+                format_decimal(stress_percent) if stress_percent > ZERO else ""
+            )
             self._suggest_stress_target()
             return
         if mode == "Target price":
@@ -2013,7 +2898,9 @@ class RiskCalculatorApp(tk.Tk):
                 f"Suggested adverse target price: {self.stress_target_price_var.get()}"
             )
         else:
-            self.status_var.set("Fetch a Yahoo price or enter a reference price first.")
+            self.status_var.set(
+                "Import MT5 history, fetch a Yahoo price, or enter a reference price first."
+            )
 
     def _suggest_stress_target(self, base_price: Decimal | None = None) -> None:
         current_value = self.stress_target_price_var.get().strip()
@@ -2060,7 +2947,7 @@ class RiskCalculatorApp(tk.Tk):
             self._suggest_stress_target()
 
     def _position_direction_changed(self, _event: object = None) -> None:
-        if self.stress_mode_var.get() == HISTORICAL_STRESS_MODE:
+        if self.stress_mode_var.get() in HISTORICAL_STRESS_MODES:
             self._update_stress_input_states()
         else:
             self._suggest_stress_target()
@@ -2092,8 +2979,9 @@ class RiskCalculatorApp(tk.Tk):
             price, currency, yahoo_symbol, timestamp = quote_data
             saved_mark = " (saved snapshot)" if row_id in self.saved_quote_rows else ""
             historical = self.historical_stresses.get(row_id)
+            history_source = self.history_sources.get(row_id, "Yahoo")
             history_mark = (
-                f" | 5y history: {historical.bar_count} bars"
+                f" | {history_source} history: {historical.bar_count} bars"
                 + (" (saved snapshot)" if row_id in self.saved_history_rows else "")
                 if historical is not None
                 else " | no 5y history"
@@ -2231,16 +3119,26 @@ class RiskCalculatorApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, self._poll_quote_result)
 
-    def _fetch_all_yahoo_data(self) -> None:
+    def _fetch_all_yahoo_data(self, only_missing: bool = False) -> None:
         if self.quote_busy:
             return
         requests = []
         for row_id, allocation in self.allocations.items():
+            if (
+                only_missing
+                and row_id in self.quotes
+                and row_id in self.historical_stresses
+            ):
+                continue
             values = self.allocation_tree.item(row_id, "values")
             requests.append(
                 (row_id, yahoo_symbol_for(allocation.index, values[1]))
             )
         if not requests:
+            if self.portfolio_suggestion_pending:
+                self.portfolio_suggestion_pending = False
+                self._generate_portfolio_settings_checked()
+                return
             messagebox.showinfo(
                 "No allocations",
                 "Add at least one robot allocation first.",
@@ -2250,7 +3148,7 @@ class RiskCalculatorApp(tk.Tk):
         self._set_fetch_busy(True)
         self._begin_yahoo_batch(len(requests))
         self.status_var.set(
-            f"Fetching Yahoo prices and 5-year history for {len(requests)} allocation(s)..."
+            f"Fetching missing Yahoo prices and history for {len(requests)} allocation(s)..."
         )
 
         def worker() -> None:
@@ -2331,7 +3229,7 @@ class RiskCalculatorApp(tk.Tk):
                     )
                 else:
                     self.status_var.set(
-                        f"Updated Yahoo price and 5-year daily history for {result.row_id}."
+                        f"Updated Yahoo price and historical data for {result.row_id}."
                     )
             self.after(100, self._poll_quote_result)
             return
@@ -2376,7 +3274,7 @@ class RiskCalculatorApp(tk.Tk):
                 )
             elif not portfolio_suggestion:
                 self.status_var.set(
-                    f"Fetched current prices and 5-year daily history for "
+                    f"Fetched current prices and historical data for "
                     f"{self.batch_completed} allocation(s)."
                 )
             return
@@ -2398,19 +3296,31 @@ class RiskCalculatorApp(tk.Tk):
             return
         if result.quote is None:
             return
-        self.quotes[row_id] = result.quote
-        self.saved_quote_rows.discard(row_id)
+        quote = result.quote
+        if (
+            result.history is None
+            and self.history_sources.get(row_id) == "MT5 CSV"
+            and self.history_bars.get(row_id)
+            and row_id in self.quotes
+        ):
+            quote = self.quotes[row_id]
+        else:
+            self.quotes[row_id] = quote
+            self.saved_quote_rows.discard(row_id)
         if result.history is not None:
             self.historical_stresses[row_id] = result.history
+            self.history_bars.pop(row_id, None)
+            self.history_sources[row_id] = "Yahoo"
             self.saved_history_rows.discard(row_id)
-        price, currency, yahoo_symbol, timestamp = result.quote
+        price, currency, yahoo_symbol, timestamp = quote
         values = list(self.allocation_tree.item(row_id, "values"))
         values[4] = f"{format_decimal(price)} {currency}"
         self.allocation_tree.item(row_id, values=values)
         if self._selected_row_id() == row_id:
             historical = self.historical_stresses.get(row_id)
+            history_source = self.history_sources.get(row_id, "Yahoo")
             history_label = (
-                f" | Yahoo 5y history ({historical.bar_count} bars)"
+                f" | {history_source} history ({historical.bar_count} bars)"
                 + (
                     " (saved snapshot)"
                     if row_id in self.saved_history_rows
@@ -2437,7 +3347,7 @@ class RiskCalculatorApp(tk.Tk):
 
     def _generate_settings(self) -> None:
         row_id = self._selected_row_id()
-        needs_history = self.stress_mode_var.get() == HISTORICAL_STRESS_MODE
+        needs_history = self.stress_mode_var.get() in HISTORICAL_STRESS_MODES
         if row_id is not None and (
             row_id not in self.quotes
             or (needs_history and row_id not in self.historical_stresses)
@@ -2482,18 +3392,24 @@ class RiskCalculatorApp(tk.Tk):
             )
             return
 
-        self.stress_mode_var.set(HISTORICAL_STRESS_MODE)
+        self.stress_mode_var.set(HISTORICAL_DRAWDOWN_MODE)
         self.position_direction_var.set("Long (price falls)")
         self._update_stress_input_states()
         self.portfolio_suggestion_pending = True
         self.output_text.delete("1.0", "end")
         self.output_text.insert(
             "1.0",
-            "Refreshing Yahoo prices and 5-year histories for every allocation. "
-            "The combined downside suggestion will be generated when all "
-            "downloads finish.\n",
+            "Using imported MT5 OHLC history where available and fetching Yahoo "
+            "data only for allocations without a price/history. The combined "
+            "downside suggestion will follow.\n",
         )
-        self._fetch_all_yahoo_data()
+        if all(
+            row_id in self.quotes and row_id in self.historical_stresses
+            for row_id in self.allocations
+        ):
+            self._generate_portfolio_settings_checked()
+            return
+        self._fetch_all_yahoo_data(only_missing=True)
 
     def _show_portfolio_suggestion_error(self, error: str) -> None:
         self.output_text.delete("1.0", "end")
@@ -2530,10 +3446,13 @@ class RiskCalculatorApp(tk.Tk):
         max_trades: int,
     ) -> list[str]:
         currency = self.currency_var.get().strip() or "account currency"
-        historical_mode = self.stress_mode_var.get() == HISTORICAL_STRESS_MODE
+        stress_mode = self.stress_mode_var.get()
+        historical_mode = stress_mode in HISTORICAL_STRESS_MODES
+        drawdown_mode = stress_mode == HISTORICAL_DRAWDOWN_MODE
         is_long = self.position_direction_var.get() == "Long (price falls)"
+        spread_points, slippage_points, _ = self._transaction_costs()
         rows: list[
-            tuple[str, str, Decimal, int, Decimal, Decimal, str, str, int]
+            tuple[str, str, Decimal, int, Decimal, Decimal, str, str, int, str]
         ] = []
         missing: list[str] = []
         total_estimated_loss = ZERO
@@ -2543,8 +3462,9 @@ class RiskCalculatorApp(tk.Tk):
             allocation = allocation_result.allocation
             quote_data = self.quotes.get(row_id)
             contract = self._contract_inputs_for_allocation(row_id)
+            _, _, commission_per_lot = self._transaction_costs(contract)
             if quote_data is None:
-                missing.append(f"{allocation.index}: Yahoo price not loaded")
+                missing.append(f"{allocation.index}: market reference price not loaded")
                 continue
 
             required = (
@@ -2587,12 +3507,24 @@ class RiskCalculatorApp(tk.Tk):
                 minimum_lot = decimal_value(
                     contract["minimum_lot"], f"{allocation.index} minimum lot"
                 )
+                maximum_lot = (
+                    decimal_value(
+                        contract["maximum_lot"], f"{allocation.index} maximum lot"
+                    )
+                    if contract.get("maximum_lot", "").strip()
+                    else None
+                )
             except ValueError as error:
                 missing.append(f"{allocation.index}: invalid MT5 contract ({error})")
                 continue
             if min(point_value, point_size, lot_increment, minimum_lot) <= ZERO:
                 missing.append(
                     f"{allocation.index}: MT5 point/volume specifications must be positive"
+                )
+                continue
+            if maximum_lot is not None and maximum_lot < minimum_lot:
+                missing.append(
+                    f"{allocation.index}: broker maximum lot is below minimum lot"
                 )
                 continue
             market_price = (
@@ -2607,19 +3539,20 @@ class RiskCalculatorApp(tk.Tk):
             if historical_mode:
                 if history is None:
                     missing.append(
-                        f"{allocation.index}: Yahoo 5-year daily history not loaded"
+                        f"{allocation.index}: MT5 or Yahoo daily history not loaded"
                     )
                     continue
-                row_stress_percent = (
-                    history.long_adverse_pct if is_long else history.short_adverse_pct
+                row_stress_percent = historical_stress_move(
+                    history, stress_mode, is_long
                 )
-                observed_date = (
-                    history.long_observed_date if is_long else history.short_observed_date
+                observed_date = historical_stress_period(
+                    history, stress_mode, is_long
                 )
                 history_bars = history.bar_count
                 if not ZERO < row_stress_percent < ONE_HUNDRED:
                     missing.append(
-                        f"{allocation.index}: historical adverse range is at least 100%"
+                        f"{allocation.index}: no valid historical adverse move below 100% "
+                        "is available (refresh history for the selected stress mode)"
                     )
                     continue
             if step_type == "enum_fixed_pips":
@@ -2637,14 +3570,54 @@ class RiskCalculatorApp(tk.Tk):
             row_max_trades = max_trades
             if historical_mode:
                 try:
-                    recommendation = suggest_safe_grid_settings(
-                        stress_points=stress_points,
-                        step_points=grid_step_points,
-                        point_value_per_lot=point_value,
-                        daily_budget=allocation_result.daily_loss_budget,
-                        lot_step=lot_increment,
-                        minimum_lot=minimum_lot,
-                    )
+                    mt5_bars = self.history_bars.get(row_id)
+                    if drawdown_mode:
+                        recommendation = suggest_safe_grid_settings(
+                            stress_points=stress_points,
+                            step_points=grid_step_points,
+                            point_value_per_lot=point_value,
+                            daily_budget=allocation_result.daily_loss_budget,
+                            lot_step=lot_increment,
+                            minimum_lot=minimum_lot,
+                            spread_points=historical_spread_floor(
+                                mt5_bars or (), spread_points
+                            ),
+                            slippage_points=slippage_points,
+                            commission_per_lot=commission_per_lot,
+                            maximum_lot=maximum_lot,
+                        )
+                    elif mt5_bars:
+                        recommendation = suggest_safe_grid_settings_from_history(
+                            bars=mt5_bars,
+                            point_size=point_size,
+                            point_value_per_lot=point_value,
+                            step_value=(
+                                step_value if step_type != "enum_fixed_pips"
+                                else grid_step_points
+                            ),
+                            step_is_percentage=step_type != "enum_fixed_pips",
+                            daily_budget=allocation_result.daily_loss_budget,
+                            lot_step=lot_increment,
+                            minimum_lot=minimum_lot,
+                            spread_points=spread_points,
+                            slippage_points=slippage_points,
+                            commission_per_lot=commission_per_lot,
+                            is_long=is_long,
+                            maximum_lot=maximum_lot,
+                        )
+                    else:
+                        recommendation = suggest_safe_grid_settings(
+                            stress_points=stress_points,
+                            step_points=grid_step_points,
+                            point_value_per_lot=point_value,
+                            daily_budget=allocation_result.daily_loss_budget,
+                            lot_step=lot_increment,
+                            minimum_lot=minimum_lot,
+                            spread_points=spread_points,
+                            slippage_points=slippage_points,
+                            commission_per_lot=commission_per_lot,
+                            maximum_lot=maximum_lot,
+                        )
                 except ValueError as error:
                     missing.append(
                         f"{allocation.index}: no safe MT5 lot/Max Trades combination "
@@ -2654,6 +3627,8 @@ class RiskCalculatorApp(tk.Tk):
                 row_max_trades = recommendation.max_trades
                 effective_lot = recommendation.initial_lot
                 loss = recommendation.estimated_loss
+                if recommendation.worst_date:
+                    observed_date = recommendation.worst_date
                 below_minimum = False
             else:
                 unit_stress = calculate_grid_stress(
@@ -2664,6 +3639,9 @@ class RiskCalculatorApp(tk.Tk):
                     max_trades=row_max_trades,
                     stress_points=stress_points,
                     daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
                 )
                 proposed_lot = (
                     (unit_stress.recommended_max_lot / lot_increment)
@@ -2680,6 +3658,9 @@ class RiskCalculatorApp(tk.Tk):
                     max_trades=row_max_trades,
                     stress_points=stress_points,
                     daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
                 ).estimated_loss
             total_estimated_loss += loss
             status = "MIN LOT EXCEEDS BUDGET" if below_minimum else "within allowance"
@@ -2694,6 +3675,7 @@ class RiskCalculatorApp(tk.Tk):
                     status,
                     observed_date,
                     history_bars,
+                    self.history_sources.get(row_id, "Yahoo"),
                 )
             )
 
@@ -2713,20 +3695,30 @@ class RiskCalculatorApp(tk.Tk):
         report = [
             "",
             (
-                "PORTFOLIO SUGGESTION (each symbol's 5-year max; 1.0 multiplier)"
+                "PORTFOLIO SUGGESTION (historical peak-to-trough drawdown; 1.0 multiplier)"
+                if drawdown_mode
+                else "PORTFOLIO SUGGESTION (each symbol's worst daily bar; 1.0 multiplier)"
                 if historical_mode
                 else "PORTFOLIO STRESS (shared Step / Max Trades; 1.0 multiplier)"
             ),
             (
-                "Uses each allocation's own largest adverse daily range from Yahoo 5y history."
+                "Sizes each grid against the largest historical peak-to-trough fall; "
+                "all DCA entries are assumed to remain open until the trough."
+                if drawdown_mode
+                else "Uses each allocation's own worst adverse daily OHLC bar; imported MT5 history is preferred, Yahoo 5y is fallback."
                 if historical_mode
                 else "Applies the same adverse percentage to every loaded index."
             ),
         ]
         if historical_mode:
             report.append(
-                "Combined as if every index reached its own worst downside session "
-                "at the same time."
+                (
+                    "Combined as if every index reached its own historical drawdown "
+                    "at the same time."
+                    if drawdown_mode
+                    else "Combined as if every index reached its own worst downside "
+                    "session at the same time."
+                )
             )
         report.extend(
             [
@@ -2745,6 +3737,7 @@ class RiskCalculatorApp(tk.Tk):
             status,
             observed_date,
             history_bars,
+            history_source,
         ) in rows:
             report.append(
                 f"{symbol:<14.14} {robot:<6} {format_decimal(row_percent, 2):>8} "
@@ -2753,7 +3746,13 @@ class RiskCalculatorApp(tk.Tk):
             )
             if historical_mode:
                 report.append(
-                    f"  {history_bars} Yahoo daily bars; worst day: {observed_date}"
+                    (
+                        f"  {history_bars} {history_source} daily bars; drawdown episode: "
+                        f"{observed_date}"
+                        if drawdown_mode
+                        else f"  {history_bars} {history_source} daily bars; "
+                        f"worst day: {observed_date}"
+                    )
                 )
         if rows:
             report.extend(
@@ -2804,17 +3803,24 @@ class RiskCalculatorApp(tk.Tk):
         if not rows:
             report.append(
                 "No combined estimate: import MT5 contract specifications and fetch "
-                "Yahoo prices for the allocations."
+                "MT5 history or Yahoo prices for the allocations."
             )
-        report.append(
-            (
+        if drawdown_mode:
+            report.append(
+                "Step Type/Value is shared from the selected row; verify it against "
+                "each EA's actual configuration. The drawdown stress assumes no "
+                "intermediate take-profit closes."
+            )
+        elif historical_mode:
+            report.append(
                 "Step Type/Value is shared from the selected row; verify it against "
                 "each EA's actual configuration."
-                if historical_mode
-                else "Other robots use this row's Step Type/Value, Max Trades, and 1.0 "
+            )
+        else:
+            report.append(
+                "Other robots use this row's Step Type/Value, Max Trades, and 1.0 "
                 "multiplier for comparison; verify their actual EA settings."
             )
-        )
         return report
 
     def _generate_settings_checked(
@@ -2827,12 +3833,12 @@ class RiskCalculatorApp(tk.Tk):
                 raise ValueError(self.status_var.get())
             return
         if require_complete_portfolio and (
-            self.stress_mode_var.get() != HISTORICAL_STRESS_MODE
+            self.stress_mode_var.get() != HISTORICAL_DRAWDOWN_MODE
             or self.position_direction_var.get() != "Long (price falls)"
         ):
             raise ValueError(
-                "A full-portfolio suggestion requires the 5-year historical "
-                "downward-move stress scenario."
+                "A full-portfolio suggestion requires the historical "
+                "peak-to-trough downward stress scenario."
             )
         row_id = self._selected_row_id()
         if row_id is None:
@@ -2840,6 +3846,9 @@ class RiskCalculatorApp(tk.Tk):
         allocation_result = self.allocation_results[row_id]
         allocation = allocation_result.allocation
         contract = self._contract_inputs_for_allocation(row_id)
+        spread_points, slippage_points, commission_per_lot = self._transaction_costs(
+            contract
+        )
         for key, variable in self._contract_input_variables().items():
             if not variable.get().strip() and contract.get(key):
                 variable.set(contract[key])
@@ -2851,7 +3860,7 @@ class RiskCalculatorApp(tk.Tk):
         }
         if self.step_type_var.get() == "Fixed pips":
             required_contract_fields["points_per_pip"] = "points per EA pip"
-        if self.stress_mode_var.get() == HISTORICAL_STRESS_MODE:
+        if self.stress_mode_var.get() in HISTORICAL_STRESS_MODES:
             required_contract_fields["contract_currency"] = (
                 "point-value currency (account currency)"
             )
@@ -2869,14 +3878,14 @@ class RiskCalculatorApp(tk.Tk):
             )
         if row_id not in self.quotes:
             raise ValueError(
-                "Fetch the Yahoo Finance price and 5-year daily history for this allocation first."
+                "Import MT5 OHLC history or fetch a Yahoo price/history for this allocation first."
             )
         price, quote_currency, yahoo_symbol, quote_time = self.quotes[row_id]
         price_in_account = decimal_value(
-            self.reference_price_var.get(), "Yahoo reference price"
+            self.reference_price_var.get(), "Market reference price"
         )
         if price_in_account <= ZERO:
-            raise ValueError("Yahoo reference price must be greater than zero.")
+            raise ValueError("Market reference price must be greater than zero.")
 
         point_value = decimal_value(
             contract["point_value"], f"{allocation.index} value of one point per lot"
@@ -2906,7 +3915,10 @@ class RiskCalculatorApp(tk.Tk):
 
         is_long = self.position_direction_var.get() == "Long (price falls)"
         historical_stress = self.historical_stresses.get(row_id)
-        historical_mode = self.stress_mode_var.get() == HISTORICAL_STRESS_MODE
+        stress_mode = self.stress_mode_var.get()
+        historical_mode = stress_mode in HISTORICAL_STRESS_MODES
+        drawdown_mode = stress_mode == HISTORICAL_DRAWDOWN_MODE
+        historical_worst_day = ""
         if self.stress_mode_var.get() == "Target price":
             target_price = decimal_value(
                 self.stress_target_price_var.get(), "Stress target price"
@@ -2927,19 +3939,25 @@ class RiskCalculatorApp(tk.Tk):
         elif historical_mode:
             if historical_stress is None:
                 raise ValueError(
-                    "Fetch Yahoo's 5-year daily history for this allocation before "
-                    "using historical stress settings."
+                    "Import MT5 OHLC history or fetch Yahoo daily history for this "
+                    "allocation before using historical stress settings."
                 )
-            stress_percent = (
-                historical_stress.short_adverse_pct
-                if not is_long
-                else historical_stress.long_adverse_pct
+            stress_percent = historical_stress_move(
+                historical_stress, stress_mode, is_long
             )
             if not ZERO < stress_percent < ONE_HUNDRED:
-                raise ValueError(
-                    "The historical adverse move is at least 100%; automatic settings "
-                    "cannot model a valid positive target price for this symbol."
+                move_name = (
+                    "peak-to-trough drawdown"
+                    if drawdown_mode
+                    else "daily adverse move"
                 )
+                raise ValueError(
+                    f"No valid historical {move_name} below 100% is available. "
+                    "Refresh the history before generating settings."
+                )
+            historical_worst_day = historical_stress_period(
+                historical_stress, stress_mode, is_long
+            )
             adverse_difference = price_in_account * stress_percent / ONE_HUNDRED
             stress_points = adverse_difference / point_size
             target_price = (
@@ -2968,8 +3986,16 @@ class RiskCalculatorApp(tk.Tk):
         minimum_lot = decimal_value(
             contract["minimum_lot"], f"{allocation.index} broker minimum lot"
         )
+        maximum_lot_text = contract.get("maximum_lot", "").strip()
+        broker_maximum_lot = (
+            decimal_value(maximum_lot_text, f"{allocation.index} broker maximum lot")
+            if maximum_lot_text
+            else None
+        )
         if lot_increment <= ZERO or minimum_lot <= ZERO:
             raise ValueError("Broker lot increment and minimum lot must be greater than zero.")
+        if broker_maximum_lot is not None and broker_maximum_lot < minimum_lot:
+            raise ValueError("Broker maximum lot cannot be below the minimum lot.")
 
         compare_count = positive_integer(
             self.compare_trades_var.get(), "Max Trades candidates"
@@ -2986,14 +4012,52 @@ class RiskCalculatorApp(tk.Tk):
                     "Historical risk suggestions need point value expressed in the "
                     "account currency. Import the MT5 contract CSV with account_currency."
                 )
-            suggestion = suggest_safe_grid_settings(
-                stress_points=stress_points,
-                step_points=step_points,
-                point_value_per_lot=point_value,
-                daily_budget=allocation_result.daily_loss_budget,
-                lot_step=lot_increment,
-                minimum_lot=minimum_lot,
-            )
+            mt5_bars = self.history_bars.get(row_id)
+            if mt5_bars and not drawdown_mode:
+                suggestion = suggest_safe_grid_settings_from_history(
+                    bars=mt5_bars,
+                    point_size=point_size,
+                    point_value_per_lot=point_value,
+                    step_value=(
+                        step_value if step_type != "enum_fixed_pips" else step_points
+                    ),
+                    step_is_percentage=step_type != "enum_fixed_pips",
+                    daily_budget=allocation_result.daily_loss_budget,
+                    lot_step=lot_increment,
+                    minimum_lot=minimum_lot,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                    is_long=is_long,
+                    maximum_lot=broker_maximum_lot,
+                )
+            else:
+                suggestion = suggest_safe_grid_settings(
+                    stress_points=stress_points,
+                    step_points=step_points,
+                    point_value_per_lot=point_value,
+                    daily_budget=allocation_result.daily_loss_budget,
+                    lot_step=lot_increment,
+                    minimum_lot=minimum_lot,
+                    spread_points=historical_spread_floor(
+                        mt5_bars or (), spread_points
+                    )
+                    if drawdown_mode
+                    else spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                    maximum_lot=broker_maximum_lot,
+                )
+            if suggestion.worst_date:
+                historical_worst_day = suggestion.worst_date
+                stress_points = suggestion.stress_points
+                adverse_difference = stress_points * point_size
+                stress_percent = adverse_difference * ONE_HUNDRED / price_in_account
+                target_price = (
+                    price_in_account - adverse_difference
+                    if is_long
+                    else price_in_account + adverse_difference
+                )
             selected_trades = suggestion.max_trades
             self.selected_trades_var.set(str(selected_trades))
             compare_count = max(compare_count, selected_trades)
@@ -3004,31 +4068,92 @@ class RiskCalculatorApp(tk.Tk):
         if selected_trades > compare_count:
             raise ValueError("Selected Max Trades must be in the candidate range.")
 
+        candidate_spread_points = (
+            historical_spread_floor(
+                self.history_bars.get(row_id, ()), spread_points
+            )
+            if drawdown_mode
+            else spread_points
+        )
         candidates: dict[int, tuple[Decimal, Decimal]] = {}
         for trades in range(1, compare_count + 1):
-            calculation = calculate_grid_stress(
-                initial_lot=ONE,
-                point_value_per_lot=point_value,
-                step_points=step_points,
-                multiplier=ONE,
-                max_trades=trades,
-                stress_points=stress_points,
-                daily_budget=allocation_result.daily_loss_budget,
-            )
+            if historical_mode and not drawdown_mode and self.history_bars.get(row_id):
+                calculation = replay_historical_grid(
+                    bars=self.history_bars[row_id],
+                    point_size=point_size,
+                    point_value_per_lot=point_value,
+                    step_value=(
+                        step_value if step_type != "enum_fixed_pips" else step_points
+                    ),
+                    step_is_percentage=step_type != "enum_fixed_pips",
+                    initial_lot=ONE,
+                    max_trades=trades,
+                    multiplier=ONE,
+                    daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                    is_long=is_long,
+                )
+                calculated_maximum_lot = calculation.recommended_max_lot
+            else:
+                calculation = calculate_grid_stress(
+                    initial_lot=ONE,
+                    point_value_per_lot=point_value,
+                    step_points=step_points,
+                    multiplier=ONE,
+                    max_trades=trades,
+                    stress_points=stress_points,
+                    daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=candidate_spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                )
+                calculated_maximum_lot = calculation.recommended_max_lot
             lot = (
-                (calculation.recommended_max_lot / lot_increment)
+                (calculated_maximum_lot / lot_increment)
                 .to_integral_value(rounding=ROUND_FLOOR)
                 * lot_increment
             )
-            loss = calculate_grid_stress(
-                initial_lot=lot if lot >= minimum_lot else minimum_lot,
-                point_value_per_lot=point_value,
-                step_points=step_points,
-                multiplier=ONE,
-                max_trades=trades,
-                stress_points=stress_points,
-                daily_budget=allocation_result.daily_loss_budget,
-            ).estimated_loss
+            if broker_maximum_lot is not None:
+                lot = min(
+                    lot,
+                    (broker_maximum_lot / lot_increment)
+                    .to_integral_value(rounding=ROUND_FLOOR)
+                    * lot_increment,
+                )
+            candidate_lot = lot if lot >= minimum_lot else minimum_lot
+            if historical_mode and not drawdown_mode and self.history_bars.get(row_id):
+                loss = replay_historical_grid(
+                    bars=self.history_bars[row_id],
+                    point_size=point_size,
+                    point_value_per_lot=point_value,
+                    step_value=(
+                        step_value if step_type != "enum_fixed_pips" else step_points
+                    ),
+                    step_is_percentage=step_type != "enum_fixed_pips",
+                    initial_lot=candidate_lot,
+                    max_trades=trades,
+                    multiplier=ONE,
+                    daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                    is_long=is_long,
+                ).estimated_loss
+            else:
+                loss = calculate_grid_stress(
+                    initial_lot=candidate_lot,
+                    point_value_per_lot=point_value,
+                    step_points=step_points,
+                    multiplier=ONE,
+                    max_trades=trades,
+                    stress_points=stress_points,
+                    daily_budget=allocation_result.daily_loss_budget,
+                    spread_points=candidate_spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                ).estimated_loss
             candidates[trades] = (lot, loss)
 
         selected_lot, selected_loss = candidates[selected_trades]
@@ -3067,7 +4192,8 @@ class RiskCalculatorApp(tk.Tk):
         robot = allocation.robot.upper()
         output = [
             f"SYMBOL / ROBOT: {allocation.index} / {robot}",
-            f"Yahoo reference: {yahoo_symbol} = {format_decimal(price_in_account)} "
+            f"Market reference ({self.history_sources.get(row_id, 'Yahoo')}): "
+            f"{yahoo_symbol} = {format_decimal(price_in_account)} "
             f"{quote_currency} ({quote_time})",
             f"Tested adverse target: {format_decimal(target_price)} "
             f"({self.position_direction_var.get()})",
@@ -3084,20 +4210,29 @@ class RiskCalculatorApp(tk.Tk):
             "-" * 46,
         ]
         if historical_mode and historical_stress is not None:
-            observed_date = (
-                historical_stress.long_observed_date
-                if is_long
-                else historical_stress.short_observed_date
+            observed_date = historical_stress_period(
+                historical_stress, stress_mode, is_long
             )
+            if historical_worst_day:
+                observed_date = historical_worst_day
             output.extend(
                 [
                     (
-                        "Historical basis: worst adverse daily High-Low / prior-close "
-                        "move in Yahoo's 5-year daily history."
+                        "Historical basis: largest peak-to-trough move. All grid entries "
+                        "are assumed to remain open until the trough; intermediate "
+                        "take-profit closes are not credited."
+                        if drawdown_mode
+                        else "Historical basis: independent daily OHLC shocks. MT5 bars are "
+                        "used when imported; otherwise Yahoo's 5-year daily history."
                     ),
                     f"Valid daily bars: {historical_stress.bar_count} "
                     f"({historical_stress.start_date} to {historical_stress.end_date})",
-                    f"Worst {self.position_direction_var.get()} session: {observed_date}",
+                    (
+                        f"Historical adverse episode: {observed_date}"
+                        if drawdown_mode
+                        else f"Worst {self.position_direction_var.get()} session: "
+                        f"{observed_date}"
+                    ),
                     "Risk settings were sized with 1.0 multiplier and the 80% "
                     "allocation allowance.",
                     "",
@@ -3173,11 +4308,124 @@ class RiskCalculatorApp(tk.Tk):
         output.extend(
             [
                 "",
+                f"Transaction-cost model per trade: configured spread floor "
+                f"{format_decimal(spread_points)} points + slippage "
+                f"{format_decimal(slippage_points)} points + round-turn commission "
+                f"{format_decimal(commission_per_lot)} per 1.00 lot.",
                 f"Estimated loss at selected settings: "
                 f"{format_decimal(selected_loss, 2)} "
                 f"{self.currency_var.get().strip() or 'account currency'}",
             ]
         )
+        mt5_bars = self.history_bars.get(row_id, ())
+        observed_spreads = [
+            bar.spread_points
+            for bar in mt5_bars
+            if bar.spread_points is not None
+        ]
+        if historical_mode and observed_spreads:
+            sampled_bars = [
+                bar
+                for bar in mt5_bars
+                if bar.spread_sample_count is not None
+            ]
+            tick_sample_count = sum(
+                bar.spread_sample_count or 0 for bar in sampled_bars
+            )
+            tick_sampled_bar_count = sum(
+                (bar.spread_sample_count or 0) > 0 for bar in sampled_bars
+            )
+            output.append(
+                "Observed MT5 spread maximum: "
+                f"{format_decimal(max(observed_spreads))} points; "
+                "applied as a per-bar spread floor against the configured value."
+            )
+            if tick_sample_count:
+                output.append(
+                    "Tick-derived spread observations: "
+                    f"{tick_sample_count} valid Bid/Ask updates across "
+                    f"{tick_sampled_bar_count} bars. "
+                    "This is not a guarantee that every spread spike was captured."
+                )
+            elif sampled_bars:
+                output.append(
+                    "No valid tick Bid/Ask spreads were exported; bars use the "
+                    "MT5 bar spread fallback."
+                )
+        if not mt5_bars:
+            output.extend(
+                [
+                    "",
+                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION: not run; import MT5 "
+                    "history first (Yahoo-only history is not sufficient).",
+                ]
+            )
+        elif not take_profit_text:
+            output.extend(
+                [
+                    "",
+                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION: not run; enter a "
+                    "strategy-specific Take Profit Value first.",
+                ]
+            )
+        else:
+            if self.take_profit_type_var.get() == "Fixed pips":
+                take_profit_points = take_profit_value * decimal_value(
+                    contract["points_per_pip"],
+                    f"{allocation.index} points per EA pip",
+                )
+            else:
+                take_profit_points = (
+                    price_in_account
+                    * take_profit_value
+                    / ONE_HUNDRED
+                    / point_size
+                )
+            campaign = backtest_historical_grid_campaign(
+                bars=mt5_bars,
+                initial_equity=allocation.capital,
+                point_size=point_size,
+                point_value_per_lot=point_value,
+                step_points=step_points,
+                take_profit_points=take_profit_points,
+                initial_lot=selected_lot,
+                max_trades=selected_trades,
+                multiplier=ONE,
+                spread_points=spread_points,
+                slippage_points=slippage_points,
+                commission_per_lot=commission_per_lot,
+                is_long=is_long,
+            )
+            output.extend(
+                [
+                    "",
+                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION (generic OHLC model)",
+                    f"Bars: {len(mt5_bars)} daily bars; campaign period "
+                    f"{mt5_bars[0].date} to {campaign.end_date}.",
+                    f"Net result: {format_decimal(campaign.net_profit, 2)} "
+                    f"{self.currency_var.get().strip() or 'account currency'} "
+                    f"on allocation equity {format_decimal(campaign.initial_equity, 2)}.",
+                    f"Maximum peak-to-trough equity drawdown: "
+                    f"{format_decimal(campaign.max_drawdown_cash, 2)} "
+                    f"({format_decimal(campaign.max_drawdown_pct, 2)}%), "
+                    f"{campaign.drawdown_peak_date} to {campaign.drawdown_trough_date}.",
+                    f"Worst modeled daily equity loss: "
+                    f"{format_decimal(campaign.worst_daily_loss, 2)} "
+                    f"on {campaign.worst_daily_loss_date}.",
+                    f"Maximum concurrent entries: {campaign.max_open_trades}; "
+                    f"basket TP closes: {campaign.take_profit_count}.",
+                    (
+                        "WARNING: the grid reached Max Trades while price crossed "
+                        "the next entry level."
+                        if campaign.grid_exhausted
+                        else "The grid did not cross its next entry level after "
+                        "reaching Max Trades."
+                    ),
+                    "This is one campaign only: after its basket TP, the model "
+                    "does not reopen without an unknown EA signal.",
+                    "",
+                ]
+            )
         portfolio_report = self._portfolio_stress_report(
             row_id,
             step_type,
@@ -3213,9 +4461,13 @@ class RiskCalculatorApp(tk.Tk):
                 "IMPORTANT:",
                 "- The step and take-profit values are strategy choices, not values "
                 "derived from the daily drawdown limit.",
-                "- Yahoo prices are references; an index quote may differ from the "
-                "broker's CFD and may be delayed.",
+                "- Yahoo prices may be delayed and differ from the broker CFD; "
+                "imported MT5 bars are broker-specific but do not predict future execution.",
                 "- Point value and volume rules must match the MT5 broker contract.",
+                "- Candidate sizing's historical replay treats daily OHLC bars as "
+                "independent shocks. The separate chronological campaign model keeps "
+                "grid entries overnight but uses an assumed adverse-first daily path; "
+                "it does not model RSI signals, margin, swap, or exact EA execution.",
                 "- This tests only the entered adverse move. Gaps, slippage, costs, "
                 "or a larger move can exceed the daily limit.",
                 "- The suggested target price is a stress-test input, not a price "
@@ -3256,6 +4508,88 @@ class RiskCalculatorApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(content)
         self.status_var.set("Settings copied to clipboard.")
+
+    def _export_set_template(self) -> None:
+        content = self.output_text.get("1.0", "end").strip()
+        selected_start = next(
+            (
+                line
+                for line in content.splitlines()
+                if line.startswith("SELECTED ") and line.endswith(" EA SETTINGS")
+            ),
+            None,
+        )
+        if selected_start is None:
+            messagebox.showinfo(
+                "Generate settings first",
+                "Generate candidate settings before exporting a .set template.",
+                parent=self,
+            )
+            return
+        robot = selected_start.removeprefix("SELECTED ").removesuffix(" EA SETTINGS")
+        settings: dict[str, str] = {}
+        for line in content.splitlines():
+            if ": " not in line:
+                continue
+            key, value = line.split(": ", 1)
+            if key in {
+                "Magic Number",
+                "Max Trades",
+                "Step Type",
+                "Step Value",
+                "Take Profit Type",
+                "Take Profit Value",
+                "Risk Type",
+                "Risk",
+                "Multiplier Factor",
+                "Entry on price break",
+                "InpPriceBreakType",
+                "Reference Price",
+                "Trade on new candle",
+                "Show Invested Money",
+                "Close When Overbought",
+                "RSI oversold",
+                "RSI Overbought",
+                "RSI Period",
+            }:
+                settings[key] = value
+        try:
+            preset_text = build_mt5_set_template(robot, settings)
+        except ValueError as error:
+            messagebox.showerror(
+                "Could not create .set template", str(error), parent=self
+            )
+            return
+
+        row_id = self._selected_row_id()
+        symbol = self.allocations[row_id].index if row_id else "robot"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export MT5 .set template",
+            defaultextension=".set",
+            filetypes=(("MT5 set files", "*.set"), ("All files", "*.*")),
+            initialfile=f"{symbol}_{robot}.set",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as preset_file:
+                preset_file.write(preset_text)
+        except OSError as error:
+            messagebox.showerror(
+                "Could not save .set template", str(error), parent=self
+            )
+            self.status_var.set("MT5 .set export failed.")
+            return
+        self.status_var.set(f"MT5 .set template exported: {path}")
+        messagebox.showwarning(
+            "Verify the MT5 inputs",
+            "This .set file uses canonical input names and enum order based on the "
+            "provided parameter list. The EA source or an existing .set preset was "
+            "not available to verify its actual input identifiers. Check every field "
+            "in MT5 before loading it on a live account.",
+            parent=self,
+        )
 
 
 if __name__ == "__main__":
