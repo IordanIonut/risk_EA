@@ -104,8 +104,39 @@ class HistoricalStressTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid spread sample count"):
                     calculate_historical_stress(bars)
 
+    def test_rejects_close_or_open_outside_bar_range(self) -> None:
+        for close, opening in (("102", None), ("98", None), ("100", "102"),
+                               ("100", "98"), ("100", "NaN")):
+            with self.subTest(close=close, opening=opening):
+                bars = [
+                    DailyBar(
+                        (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                        Decimal("101"), Decimal("99"), Decimal(close),
+                        open=Decimal(opening) if opening is not None else None,
+                    )
+                    for index in range(20)
+                ]
+                with self.assertRaisesRegex(ValueError, "invalid prices"):
+                    calculate_historical_stress(bars)
+
 
 class SafeGridSuggestionTests(unittest.TestCase):
+    def test_endpoint_entry_costs_can_reduce_the_suggested_trade_count(self) -> None:
+        result = suggest_safe_grid_settings(
+            stress_points=Decimal("10"),
+            step_points=Decimal("10"),
+            point_value_per_lot=Decimal("1"),
+            daily_budget=Decimal("16"),
+            lot_step=Decimal("1"),
+            minimum_lot=Decimal("1"),
+            max_trades_limit=2,
+            spread_points=Decimal("2"),
+        )
+        self.assertEqual(result.max_trades, 1)
+        self.assertEqual(result.initial_lot, Decimal("1"))
+        self.assertEqual(result.estimated_loss, Decimal("12"))
+        self.assertLessEqual(result.estimated_loss, result.loss_budget)
+
     def test_peak_to_trough_shock_sizes_lot_against_the_full_pullback(self) -> None:
         drawdown_suggestion = suggest_safe_grid_settings(
             stress_points=Decimal("2500"),
@@ -143,7 +174,7 @@ class SafeGridSuggestionTests(unittest.TestCase):
             minimum_lot=Decimal("0.01"),
         )
 
-        self.assertEqual(result.max_trades, 10)
+        self.assertEqual(result.max_trades, 11)
         self.assertEqual(result.initial_lot, Decimal("0.01"))
         self.assertLessEqual(result.estimated_loss, result.loss_budget)
 
@@ -188,6 +219,19 @@ class SafeGridSuggestionTests(unittest.TestCase):
 
 
 class TransactionCostTests(unittest.TestCase):
+    def test_charges_entry_costs_when_stress_exactly_reaches_next_level(self) -> None:
+        result = calculate_grid_stress(
+            initial_lot=Decimal("1"),
+            point_value_per_lot=Decimal("1"),
+            step_points=Decimal("10"),
+            multiplier=Decimal("1"),
+            max_trades=2,
+            stress_points=Decimal("10"),
+            daily_budget=Decimal("100"),
+            spread_points=Decimal("2"),
+        )
+        self.assertEqual(result.estimated_loss, Decimal("14"))
+
     def test_spread_slippage_and_commission_are_added_per_open_trade(self) -> None:
         without_costs = calculate_grid_stress(
             initial_lot=Decimal("0.1"),
@@ -229,6 +273,92 @@ class TransactionCostTests(unittest.TestCase):
 
 
 class HistoricalGridReplayTests(unittest.TestCase):
+    def test_historical_suggestion_accounts_for_endpoint_entry_costs(self) -> None:
+        bars = [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal("100"), Decimal("90"), Decimal("100"),
+            )
+            for index in range(20)
+        ]
+        result = suggest_safe_grid_settings_from_history(
+            bars=bars,
+            point_size=Decimal("1"),
+            point_value_per_lot=Decimal("1"),
+            step_value=Decimal("10"),
+            step_is_percentage=False,
+            daily_budget=Decimal("16"),
+            lot_step=Decimal("1"),
+            minimum_lot=Decimal("1"),
+            max_trades_limit=2,
+            spread_points=Decimal("2"),
+        )
+        self.assertEqual(result.max_trades, 1)
+        self.assertEqual(result.estimated_loss, Decimal("12"))
+        self.assertLessEqual(result.estimated_loss, result.loss_budget)
+
+    def test_entirely_flat_history_can_still_model_spread_loss(self) -> None:
+        bars = [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal("100"), Decimal("100"), Decimal("100"), Decimal("10"),
+            )
+            for index in range(20)
+        ]
+        result = replay_historical_grid(
+            bars=bars,
+            point_size=Decimal("1"),
+            point_value_per_lot=Decimal("1"),
+            step_value=Decimal("5"),
+            step_is_percentage=False,
+            initial_lot=Decimal("1"),
+            max_trades=3,
+            multiplier=Decimal("1"),
+            daily_budget=Decimal("100"),
+        )
+        self.assertEqual(result.estimated_loss, Decimal("10"))
+        self.assertEqual(result.recommended_max_lot, Decimal("8"))
+
+    def test_flat_history_without_costs_cannot_determine_a_lot_ceiling(self) -> None:
+        bars = [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal("100"), Decimal("100"), Decimal("100"),
+            )
+            for index in range(20)
+        ]
+        with self.assertRaisesRegex(ValueError, "No modeled price or transaction-cost loss"):
+            suggest_safe_grid_settings_from_history(
+                bars=bars,
+                point_size=Decimal("1"),
+                point_value_per_lot=Decimal("1"),
+                step_value=Decimal("5"),
+                step_is_percentage=False,
+                daily_budget=Decimal("100"),
+                lot_step=Decimal("0.01"),
+                minimum_lot=Decimal("0.01"),
+            )
+
+    def test_flat_bar_still_contributes_transaction_cost_risk(self) -> None:
+        bars = self._bars()
+        bars[8] = DailyBar(
+            bars[8].date, Decimal("95"), Decimal("95"), Decimal("95"),
+            Decimal("100"),
+        )
+        result = replay_historical_grid(
+            bars=bars,
+            point_size=Decimal("1"),
+            point_value_per_lot=Decimal("1"),
+            step_value=Decimal("5"),
+            step_is_percentage=False,
+            initial_lot=Decimal("1"),
+            max_trades=3,
+            multiplier=Decimal("1"),
+            daily_budget=Decimal("1000"),
+        )
+        self.assertEqual(result.worst_date, bars[8].date)
+        self.assertEqual(result.estimated_loss, Decimal("100"))
+
     def _bars(self) -> list[DailyBar]:
         start = date(2026, 1, 1)
         bars = [
@@ -324,6 +454,136 @@ class HistoricalGridReplayTests(unittest.TestCase):
 
 
 class HistoricalGridCampaignBacktestTests(unittest.TestCase):
+    def _price_path(self, prices: list[tuple[str, str, str, str]]) -> list[DailyBar]:
+        last_close = prices[-1][3]
+        prices = prices + [(last_close,) * 4] * (20 - len(prices))
+        return [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal(high), Decimal(low), Decimal(close), open=Decimal(opening),
+            )
+            for index, (opening, high, low, close) in enumerate(prices)
+        ]
+
+    def test_later_recovery_does_not_change_previous_drawdown_pct_or_dates(self) -> None:
+        result = self._run(
+            self._price_path([
+                ("100", "100", "100", "100"),
+                ("100", "100", "50", "90"),
+                ("90", "200", "90", "190"),
+            ]),
+            initial_equity=Decimal("100"),
+            initial_lot=Decimal("1"),
+            max_trades=1,
+            take_profit_points=Decimal("1000"),
+        )
+        self.assertEqual(result.max_drawdown_cash, Decimal("50"))
+        self.assertEqual(result.max_drawdown_pct, Decimal("50"))
+        self.assertEqual(result.drawdown_peak_date, "2026-01-01")
+        self.assertEqual(result.drawdown_trough_date, "2026-01-02")
+
+    def test_cash_and_percentage_drawdown_maxima_are_tracked_independently(self) -> None:
+        result = self._run(
+            self._price_path([
+                ("100", "100", "100", "100"),
+                ("100", "100", "50", "100"),
+                ("100", "300", "100", "300"),
+                ("300", "300", "240", "300"),
+            ]),
+            initial_equity=Decimal("100"),
+            initial_lot=Decimal("1"),
+            max_trades=1,
+            take_profit_points=Decimal("1000"),
+        )
+        self.assertEqual(result.max_drawdown_cash, Decimal("60"))
+        self.assertEqual(result.max_drawdown_pct, Decimal("50"))
+        self.assertEqual(result.drawdown_peak_date, "2026-01-03")
+        self.assertEqual(result.drawdown_trough_date, "2026-01-04")
+
+    def test_adverse_gap_fills_at_open_then_reanchors_grid(self) -> None:
+        for is_long, opening in ((True, "80"), (False, "120")):
+            with self.subTest(is_long=is_long):
+                result = self._run(
+                    self._price_path([
+                        ("100", "100", "100", "100"),
+                        (opening, opening, opening, opening),
+                    ]),
+                    initial_lot=Decimal("1"),
+                    take_profit_points=Decimal("100"),
+                    is_long=is_long,
+                )
+                self.assertEqual(result.net_profit, Decimal("-20"))
+                self.assertEqual(result.max_open_trades, 2)
+                self.assertEqual(result.max_drawdown_cash, Decimal("20"))
+                self.assertEqual(result.worst_daily_loss, Decimal("20"))
+
+    def test_favorable_open_closes_basket_before_later_adverse_move(self) -> None:
+        for is_long, prices in (
+            (True, ("110", "111", "50", "100")),
+            (False, ("90", "150", "89", "100")),
+        ):
+            with self.subTest(is_long=is_long):
+                result = self._run(
+                    self._price_path([
+                        ("100", "100", "100", "100"), prices,
+                    ]),
+                    initial_lot=Decimal("1"),
+                    is_long=is_long,
+                )
+                self.assertEqual(result.net_profit, Decimal("10"))
+                self.assertEqual(result.max_open_trades, 1)
+                self.assertEqual(result.take_profit_count, 1)
+                self.assertEqual(result.max_drawdown_cash, Decimal("0"))
+
+    def test_gap_loss_includes_costs_of_all_filled_orders(self) -> None:
+        result = self._run(
+            self._price_path([
+                ("100", "100", "100", "100"),
+                ("80", "80", "80", "80"),
+            ]),
+            initial_lot=Decimal("1"),
+            take_profit_points=Decimal("100"),
+            spread_points=Decimal("2"),
+            slippage_points=Decimal("1"),
+            commission_per_lot=Decimal("0.5"),
+        )
+        self.assertEqual(result.net_profit, Decimal("-27"))
+        self.assertEqual(result.max_drawdown_cash, Decimal("27"))
+        self.assertEqual(result.worst_daily_loss, Decimal("23.5"))
+
+    def test_missing_open_fallback_stays_inside_bar_range(self) -> None:
+        bars = [
+            DailyBar(
+                bar.date, bar.high, bar.low, bar.close,
+            )
+            for bar in self._price_path([
+                ("100", "100", "100", "100"),
+                ("80", "81", "79", "80"),
+            ])
+        ]
+        result = self._run(
+            bars, initial_lot=Decimal("1"), take_profit_points=Decimal("100"),
+        )
+        self.assertEqual(result.max_open_trades, 2)
+        self.assertEqual(result.net_profit, Decimal("-21"))
+        self.assertEqual(result.max_drawdown_cash, Decimal("23"))
+
+    def test_equity_at_favorable_open_is_observed_before_adverse_extreme(self) -> None:
+        result = self._run(
+            self._price_path([
+                ("100", "100", "100", "100"),
+                ("120", "120", "80", "100"),
+            ]),
+            initial_equity=Decimal("100"),
+            initial_lot=Decimal("1"),
+            max_trades=1,
+            take_profit_points=Decimal("1000"),
+        )
+        self.assertEqual(result.max_drawdown_cash, Decimal("40"))
+        self.assertEqual(result.max_drawdown_pct, Decimal("4000") / Decimal("120"))
+        self.assertEqual(result.drawdown_peak_date, "2026-01-02")
+        self.assertEqual(result.drawdown_trough_date, "2026-01-02")
+
     def _bars(
         self,
         adverse_low: str = "90",
@@ -381,11 +641,15 @@ class HistoricalGridCampaignBacktestTests(unittest.TestCase):
         )
 
         self.assertEqual(result.net_profit, Decimal("0.45"))
-        self.assertEqual(result.max_drawdown_cash, Decimal("2.65"))
+        self.assertEqual(result.max_drawdown_cash, Decimal("2.55"))
 
     def test_reports_grid_exhaustion_and_liquidates_open_positions_at_end(self) -> None:
         result = self._run(
-            self._bars(adverse_low="80", recovery_high="81", adverse_close="80"),
+            self._price_path([
+                ("100", "100", "100", "100"),
+                ("100", "100", "80", "80"),
+                ("80", "101", "80", "100"),
+            ]),
             max_trades=2,
         )
 

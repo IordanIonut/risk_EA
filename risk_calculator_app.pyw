@@ -382,14 +382,27 @@ def fetch_yahoo_historical_stress(symbol: str) -> HistoricalStress:
     closes = bars_data.get("close", [])
     if not all(isinstance(values, list) for values in (highs, lows, closes)):
         raise ValueError(f"Yahoo Finance returned malformed daily history for {symbol}.")
+    if any(len(values) != len(timestamps) for values in (highs, lows, closes)):
+        raise ValueError(
+            f"Yahoo Finance returned mismatched daily history array lengths for {symbol}."
+        )
     bars: list[DailyBar] = []
     for index, timestamp in enumerate(timestamps):
-        if index >= len(highs) or index >= len(lows) or index >= len(closes):
-            continue
         if highs[index] is None or lows[index] is None or closes[index] is None:
-            continue
+            raise ValueError(
+                f"Yahoo Finance daily history for {symbol}, bar {index + 1}, "
+                "has missing prices; incomplete history cannot be used for sizing."
+            )
         try:
+            if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+                raise ValueError("Expected a numeric Unix timestamp.")
             date = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        except (OverflowError, OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Yahoo Finance returned an invalid timestamp for {symbol}, "
+                f"bar {index + 1}."
+            ) from error
+        try:
             bars.append(
                 DailyBar(
                     date=date,
@@ -417,11 +430,12 @@ def parse_mt5_history_csv(
     def normalized_header(value: str) -> str:
         return value.strip().strip("<>").strip().lower()
 
-    header_map = {
-        normalized_header(name): name
-        for name in reader.fieldnames
-        if name is not None
-    }
+    header_map: dict[str, str] = {}
+    for name in reader.fieldnames:
+        normalized = normalized_header(name)
+        if not normalized or normalized in header_map:
+            raise ValueError("MT5 history CSV has an empty or duplicate column header.")
+        header_map[normalized] = name
     required = ("date", "high", "low", "close")
     missing = [name for name in required if name not in header_map]
     if missing:
@@ -437,15 +451,19 @@ def parse_mt5_history_csv(
     def parse_timestamp(date_text: str, time_text: str) -> datetime:
         clean_date = date_text.strip()
         clean_time = time_text.strip()
-        if clean_date.endswith("Z"):
-            clean_date = clean_date[:-1]
-        clean_date = clean_date.replace(".", "-")
+        if re.match(r"^\d{4}\.\d{2}\.\d{2}", clean_date):
+            clean_date = clean_date.replace(".", "-", 2)
         combined = f"{clean_date} {clean_time}".strip()
-        for candidate in (combined, clean_date):
-            try:
-                return datetime.fromisoformat(candidate)
-            except ValueError:
-                continue
+        try:
+            timestamp = datetime.fromisoformat(combined)
+        except ValueError:
+            pass
+        else:
+            if timestamp.tzinfo is not None:
+                raise ValueError(
+                    "MT5 date/time must use broker-local time without a timezone offset."
+                )
+            return timestamp
         for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
                 return datetime.strptime(combined, pattern)
@@ -464,14 +482,20 @@ def parse_mt5_history_csv(
                 Decimal,
                 Decimal | None,
                 int | None,
+                datetime,
+                Decimal | None,
             ],
         ],
     ] = {}
+    seen_timestamps: dict[str, set[datetime]] = {}
+    symbol_timeframes: dict[str, str] = {}
     row_count = 0
     for line_number, row in enumerate(reader, start=2):
         row_count += 1
         if None in row:
             raise ValueError(f"MT5 history CSV row {line_number} has too many columns.")
+        if any(value is None for value in row.values()):
+            raise ValueError(f"MT5 history CSV row {line_number} has missing columns.")
         raw_symbol = (
             row.get(header_map["symbol"], "").strip()
             if "symbol" in header_map
@@ -486,6 +510,12 @@ def parse_mt5_history_csv(
             high = decimal_value(row.get(header_map["high"], ""), "MT5 bar high")
             low = decimal_value(row.get(header_map["low"], ""), "MT5 bar low")
             close = decimal_value(row.get(header_map["close"], ""), "MT5 bar close")
+            open_text = (
+                row.get(header_map["open"], "").strip()
+                if "open" in header_map
+                else ""
+            )
+            opening = decimal_value(open_text, "MT5 bar open") if open_text else None
             spread_header = next(
                 (
                     header_map[name]
@@ -495,7 +525,7 @@ def parse_mt5_history_csv(
                         "spread_points",
                         "spread",
                     )
-                    if name in header_map
+                    if name in header_map and row.get(header_map[name], "").strip()
                 ),
                 None,
             )
@@ -522,7 +552,11 @@ def parse_mt5_history_csv(
                 raise ValueError("MT5 bar spread sample count must be non-negative.")
         except ValueError as error:
             raise ValueError(f"MT5 history CSV row {line_number}: {error}") from error
-        if min(high, low, close) <= ZERO or high < low:
+        if (
+            min(high, low, close) <= ZERO
+            or not low <= close <= high
+            or (opening is not None and not low <= opening <= high)
+        ):
             raise ValueError(
                 f"MT5 history CSV row {line_number} contains invalid OHLC prices."
             )
@@ -531,6 +565,25 @@ def parse_mt5_history_csv(
                 f"MT5 history CSV row {line_number} contains a negative spread."
             )
         symbol_key = raw_symbol.strip().upper()
+        timeframe = (
+            row[header_map["timeframe"]].strip().upper()
+            if "timeframe" in header_map
+            else ""
+        )
+        if timeframe:
+            previous_timeframe = symbol_timeframes.setdefault(symbol_key, timeframe)
+            if timeframe != previous_timeframe:
+                raise ValueError(
+                    f"MT5 history CSV row {line_number} mixes timeframes for "
+                    f"{symbol_key}: {previous_timeframe} and {timeframe}."
+                )
+        symbol_timestamps = seen_timestamps.setdefault(symbol_key, set())
+        if timestamp in symbol_timestamps:
+            raise ValueError(
+                f"MT5 history CSV row {line_number} has a duplicate timestamp "
+                f"for {symbol_key}: {timestamp.isoformat()}."
+            )
+        symbol_timestamps.add(timestamp)
         day = timestamp.date().isoformat()
         daily_rows = grouped.setdefault(symbol_key, {})
         previous = daily_rows.get(day)
@@ -542,6 +595,8 @@ def parse_mt5_history_csv(
                 close,
                 spread,
                 sample_count,
+                timestamp,
+                opening,
             )
         else:
             spreads = tuple(
@@ -559,6 +614,8 @@ def parse_mt5_history_csv(
                 close if timestamp >= previous[0] else previous[3],
                 max(spreads) if spreads else None,
                 sum(sample_counts) if sample_counts else None,
+                min(timestamp, previous[6]),
+                opening if timestamp < previous[6] else previous[7],
             )
 
     if row_count == 0:
@@ -574,6 +631,7 @@ def parse_mt5_history_csv(
                 values[3],
                 values[4],
                 values[5],
+                values[7],
             )
             for date, values in sorted(daily_rows.items())
         )
@@ -705,6 +763,7 @@ class RiskCalculatorApp(tk.Tk):
         self.minsize(980, 700)
 
         self.allocations: dict[str, Allocation] = {}
+        self.next_allocation_id = 1
         self.allocation_results: dict[str, AllocationResult] = {}
         self.contract_inputs: dict[str, ContractFields] = {}
         self.quotes: dict[str, QuoteData] = {}
@@ -714,6 +773,7 @@ class RiskCalculatorApp(tk.Tk):
         self.magic_assignments: dict[str, int] = {}
         self.quote_messages: queue.Queue[tuple[str, str, object]] = queue.Queue()
         self.quote_busy = False
+        self.quote_request_cancelled = False
         self.fetch_all_button: ttk.Button | None = None
         self.batch_total = 0
         self.batch_completed = 0
@@ -725,6 +785,8 @@ class RiskCalculatorApp(tk.Tk):
         self.saved_quote_rows: set[str] = set()
         self.saved_history_rows: set[str] = set()
         self.auto_stress_target_price: str | None = None
+        self.generated_scenario: dict[str, object] | None = None
+        self.generated_output = ""
 
         self._build_ui()
         self._add_default_allocation()
@@ -889,6 +951,7 @@ class RiskCalculatorApp(tk.Tk):
                             "high": str(bar.high),
                             "low": str(bar.low),
                             "close": str(bar.close),
+                            "open": str(bar.open) if bar.open is not None else "",
                             "spread_points": (
                                 str(bar.spread_points)
                                 if bar.spread_points is not None
@@ -908,7 +971,7 @@ class RiskCalculatorApp(tk.Tk):
         selected_index = row_ids.index(selected_id) if selected_id in row_ids else None
         return {
             "format": "mt5-risk-planner-scenario",
-            "version": 12,
+            "version": 13,
             "portfolio": {
                 "account_capital": self.account_capital_var.get(),
                 "currency": self.currency_var.get(),
@@ -948,7 +1011,7 @@ class RiskCalculatorApp(tk.Tk):
             data.get("format") != "mt5-risk-planner-scenario"
             or isinstance(version, bool)
             or not isinstance(version, int)
-            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
         ):
             raise ValueError("Unsupported or unrecognized scenario file format.")
 
@@ -987,7 +1050,7 @@ class RiskCalculatorApp(tk.Tk):
         if portfolio["limit_mode"] not in ("Percent of account", "Cash amount"):
             raise ValueError("Scenario has an invalid daily limit mode.")
         account_capital = decimal_value(
-            portfolio["account_capital"], "Scenario account capital"
+            required_text(portfolio, "account_capital"), "Scenario account capital"
         )
         prop_loss_room = prop_loss_room_text.strip()
         if prop_loss_room:
@@ -1013,7 +1076,7 @@ class RiskCalculatorApp(tk.Tk):
         new_allocation = required_mapping(data, "new_allocation")
         for field in ("symbol", "yahoo_ticker", "robot", "capital"):
             required_text(new_allocation, field)
-        if new_allocation["robot"].upper() not in ("DCA", "RSI"):
+        if required_text(new_allocation, "robot").upper() not in ("DCA", "RSI"):
             raise ValueError("New allocation robot must be DCA or RSI.")
 
         raw_allocations = data.get("allocations")
@@ -1149,14 +1212,14 @@ class RiskCalculatorApp(tk.Tk):
                         decimal_value(
                             long_pct, f"Allocation {position} long historical stress"
                         )
-                        <= ZERO
+                        < ZERO
                         or decimal_value(
                             short_pct, f"Allocation {position} short historical stress"
                         )
-                        <= ZERO
+                        < ZERO
                     ):
                         raise ValueError(
-                            f"Allocation {position} historical stress percentages must be positive."
+                            f"Allocation {position} historical stress percentages must be non-negative."
                         )
                     raw_count = raw_stress.get("bar_count")
                     if (
@@ -1176,10 +1239,18 @@ class RiskCalculatorApp(tk.Tk):
                             "end_date",
                         )
                     }
+                    for direction, pct_text in (("long", long_pct), ("short", short_pct)):
+                        if decimal_value(pct_text, "Historical stress percent") == ZERO:
+                            if stress_dates[f"{direction}_observed_date"]:
+                                raise ValueError(
+                                    f"Allocation {position} {direction} daily stress "
+                                    "dates must be empty when the move is zero."
+                                )
                     try:
                         parsed_dates = {
                             field: datetime.strptime(value, "%Y-%m-%d").date()
                             for field, value in stress_dates.items()
+                            if value or field in ("start_date", "end_date")
                         }
                     except ValueError as error:
                         raise ValueError(
@@ -1187,15 +1258,28 @@ class RiskCalculatorApp(tk.Tk):
                         ) from error
                     if (
                         parsed_dates["start_date"] > parsed_dates["end_date"]
-                        or not parsed_dates["start_date"]
-                        <= parsed_dates["long_observed_date"]
-                        <= parsed_dates["end_date"]
-                        or not parsed_dates["start_date"]
-                        <= parsed_dates["short_observed_date"]
-                        <= parsed_dates["end_date"]
+                        or any(
+                            not (
+                                parsed_dates["start_date"]
+                                <= parsed_dates[field]
+                                <= parsed_dates["end_date"]
+                            )
+                            for field in ("long_observed_date", "short_observed_date")
+                            if field in parsed_dates
+                        )
                     ):
                         raise ValueError(
                             f"Allocation {position} historical dates are inconsistent."
+                        )
+                    if (
+                        decimal_value(long_pct, "Long historical stress") > ZERO
+                        and "long_observed_date" not in parsed_dates
+                    ) or (
+                        decimal_value(short_pct, "Short historical stress") > ZERO
+                        and "short_observed_date" not in parsed_dates
+                    ):
+                        raise ValueError(
+                            f"Allocation {position} positive daily stress needs an observed date."
                         )
                     drawdown_values: dict[str, str] = {}
                     drawdown_date_pairs = (
@@ -1301,6 +1385,12 @@ class RiskCalculatorApp(tk.Tk):
                             f"Allocation {position} history bar {bar_index} has an invalid date."
                         ) from error
                     raw_spread = raw_bar.get("spread_points", "")
+                    raw_open = raw_bar.get("open", "")
+                    if not isinstance(raw_open, str):
+                        raise ValueError(
+                            f"Allocation {position} history bar {bar_index} "
+                            "open must be text."
+                        )
                     if not isinstance(raw_spread, str):
                         raise ValueError(
                             f"Allocation {position} history bar {bar_index} "
@@ -1352,6 +1442,14 @@ class RiskCalculatorApp(tk.Tk):
                         if raw_spread.strip()
                         else None,
                         spread_sample_count,
+                        (
+                            decimal_value(
+                                raw_open,
+                                f"Allocation {position} history open",
+                            )
+                            if raw_open.strip()
+                            else None
+                        ),
                     )
                     if (
                         parsed_bar.spread_points is not None
@@ -1368,6 +1466,11 @@ class RiskCalculatorApp(tk.Tk):
                             "high": str(parsed_bar.high),
                             "low": str(parsed_bar.low),
                             "close": str(parsed_bar.close),
+                            "open": (
+                                str(parsed_bar.open)
+                                if parsed_bar.open is not None
+                                else ""
+                            ),
                             "spread_points": (
                                 str(parsed_bar.spread_points)
                                 if parsed_bar.spread_points is not None
@@ -1391,25 +1494,8 @@ class RiskCalculatorApp(tk.Tk):
                         raise ValueError(
                             f"Allocation {position} MT5 history bars need matching historical stress data."
                         )
-                    historical_stress.update(
-                        {
-                            "long_drawdown_pct": str(
-                                computed_stress.long_drawdown_pct
-                            ),
-                            "long_drawdown_peak_date": (
-                                computed_stress.long_drawdown_peak_date
-                            ),
-                            "long_drawdown_trough_date": (
-                                computed_stress.long_drawdown_trough_date
-                            ),
-                            "short_rally_pct": str(computed_stress.short_rally_pct),
-                            "short_rally_trough_date": (
-                                computed_stress.short_rally_trough_date
-                            ),
-                            "short_rally_peak_date": (
-                                computed_stress.short_rally_peak_date
-                            ),
-                        }
+                    historical_stress = RiskCalculatorApp._historical_stress_data(
+                        computed_stress
                     )
                     if normalized_quote is None:
                         raise ValueError(
@@ -1566,6 +1652,8 @@ class RiskCalculatorApp(tk.Tk):
     def _write_scenario(self, path: str) -> None:
         temporary_path = ""
         try:
+            scenario_data = self._scenario_data()
+            self._validate_scenario(scenario_data)
             directory = os.path.dirname(os.path.abspath(path))
             file_descriptor, temporary_path = tempfile.mkstemp(
                 prefix=".mt5-scenario-",
@@ -1575,7 +1663,7 @@ class RiskCalculatorApp(tk.Tk):
             )
             with os.fdopen(file_descriptor, "w", encoding="utf-8") as scenario_file:
                 json.dump(
-                    self._scenario_data(),
+                    scenario_data,
                     scenario_file,
                     ensure_ascii=False,
                     indent=2,
@@ -1625,6 +1713,11 @@ class RiskCalculatorApp(tk.Tk):
         )
 
     def _apply_scenario(self, scenario: dict[str, object]) -> None:
+        self.generated_scenario = None
+        self.generated_output = ""
+        self.portfolio_suggestion_pending = False
+        if self.quote_busy:
+            self.quote_request_cancelled = True
         portfolio = scenario["portfolio"]
         new_allocation = scenario["new_allocation"]
         settings = scenario["settings"]
@@ -1724,6 +1817,7 @@ class RiskCalculatorApp(tk.Tk):
                             if bar.get("spread_sample_count")
                             else None
                         ),
+                        Decimal(bar["open"]) if bar.get("open") else None,
                     )
                     for bar in raw_history_bars
                 )
@@ -1757,11 +1851,16 @@ class RiskCalculatorApp(tk.Tk):
         self.allocation_results.clear()
         selected_index = scenario["selected_allocation"]
         if selected_index is not None:
+            if (
+                isinstance(selected_index, bool)
+                or not isinstance(selected_index, int)
+                or not 0 <= selected_index < len(self.allocations)
+            ):
+                raise ValueError("Scenario selected allocation index is invalid.")
             selected_row = list(self.allocations)[selected_index]
-            selected_item = self.allocations[selected_row]
-            values = self.allocation_tree.item(selected_row, "values")
-            selected_label = (
-                f"{selected_item.index} | {selected_item.robot} | {values[1]}"
+            selected_label = next(
+                label for label, row_id in self.selection_ids.items()
+                if row_id == selected_row
             )
             self.selected_allocation_var.set(selected_label)
             self.allocation_tree.selection_set(selected_row)
@@ -2368,9 +2467,8 @@ class RiskCalculatorApp(tk.Tk):
         if capital <= ZERO:
             raise ValueError("Allocated capital must be greater than zero.")
         ticker = yahoo_symbol_for(symbol, ticker)
-        row_id = f"allocation-{len(self.allocations) + 1}"
-        while row_id in self.allocations:
-            row_id += "-new"
+        row_id = f"allocation-{self.next_allocation_id}"
+        self.next_allocation_id += 1
         allocation = Allocation(symbol, robot, capital)
         self.allocations[row_id] = allocation
         self.allocation_tree.insert(
@@ -2430,7 +2528,7 @@ class RiskCalculatorApp(tk.Tk):
         for row_id, allocation in self.allocations.items():
             values = self.allocation_tree.item(row_id, "values")
             ticker = values[1]
-            label = f"{allocation.index} | {allocation.robot} | {ticker}"
+            label = f"{allocation.index} | {allocation.robot} | {ticker} [{row_id}]"
             choices.append(label)
             self.selection_ids[label] = row_id
         self.allocation_combo["values"] = choices
@@ -2484,11 +2582,14 @@ class RiskCalculatorApp(tk.Tk):
             if not reader.fieldnames:
                 raise ValueError("The MT5 contract CSV must have a header row.")
 
-            header_lookup = {
-                re.sub(r"[^a-z0-9]", "", header.casefold()): header
-                for header in reader.fieldnames
-                if header
-            }
+            header_lookup: dict[str, str] = {}
+            for header in reader.fieldnames:
+                normalized = re.sub(r"[^a-z0-9]", "", header.casefold())
+                if not normalized or normalized in header_lookup:
+                    raise ValueError(
+                        "MT5 contract CSV has an empty or duplicate column header."
+                    )
+                header_lookup[normalized] = header
             aliases = {
                 "symbol": ("symbol", "brokersymbol"),
                 "point_size": ("pointsize", "mt5pointsize"),
@@ -2511,18 +2612,16 @@ class RiskCalculatorApp(tk.Tk):
                     "accountcurrency",
                     "pointvaluecurrency",
                     "accountcurrencyforpointvalue",
-                    "profitcurrency",
                     "contractcurrency",
                 ),
             }
-            selected_headers: dict[str, str] = {}
+            selected_headers: dict[str, list[str]] = {}
             for field, candidates in aliases.items():
-                header = next(
-                    (header_lookup[name] for name in candidates if name in header_lookup),
-                    None,
-                )
-                if header:
-                    selected_headers[field] = header
+                headers = [
+                    header_lookup[name] for name in candidates if name in header_lookup
+                ]
+                if headers:
+                    selected_headers[field] = headers
             required_fields = (
                 "symbol",
                 "point_size",
@@ -2540,18 +2639,38 @@ class RiskCalculatorApp(tk.Tk):
 
             contracts: dict[str, ContractFields] = {}
             for line_number, row in enumerate(reader, start=2):
+                if None in row:
+                    raise ValueError(f"CSV row {line_number} has too many columns.")
+                if any(value is None for value in row.values()):
+                    raise ValueError(f"CSV row {line_number} has missing columns.")
                 if not row or not any(value and value.strip() for value in row.values()):
                     continue
-                symbol = (row.get(selected_headers["symbol"]) or "").strip()
+                contract: ContractFields = {}
+                for field, headers in selected_headers.items():
+                    values = [
+                        row[header].strip() for header in headers if row[header].strip()
+                    ]
+                    if values:
+                        if field in ("symbol", "contract_currency"):
+                            equivalent = len({value.upper() for value in values}) == 1
+                        else:
+                            numeric_values = [
+                                decimal_value(value, f"CSV row {line_number} {field}")
+                                for value in values
+                            ]
+                            equivalent = len(set(numeric_values)) == 1
+                        if not equivalent:
+                            raise ValueError(
+                                f"CSV row {line_number} has conflicting columns for {field}."
+                            )
+                    contract[field] = values[0] if values else ""
+                symbol = contract["symbol"]
                 key = cls._normalized_broker_symbol(symbol)
                 if not key:
                     raise ValueError(f"CSV row {line_number} has no symbol.")
                 if key in contracts:
                     raise ValueError(f"CSV has duplicate symbol '{symbol}'.")
 
-                contract: ContractFields = {}
-                for field, header in selected_headers.items():
-                    contract[field] = (row.get(header) or "").strip()
                 contract["symbol"] = symbol
                 for field in (
                     "point_size",
@@ -2919,7 +3038,10 @@ class RiskCalculatorApp(tk.Tk):
             )
         except ValueError:
             return
-        if base_price <= ZERO or not ZERO < percent < ONE_HUNDRED:
+        is_long = self.position_direction_var.get() == "Long (price falls)"
+        if base_price <= ZERO or percent <= ZERO or (
+            is_long and percent >= ONE_HUNDRED
+        ):
             return
         factor = ONE - percent / ONE_HUNDRED
         if self.position_direction_var.get() == "Short (price rises)":
@@ -3196,6 +3318,8 @@ class RiskCalculatorApp(tk.Tk):
 
     def _set_fetch_busy(self, busy: bool) -> None:
         self.quote_busy = busy
+        if busy:
+            self.quote_request_cancelled = False
         state = "disabled" if busy else "normal"
         self.fetch_button.configure(state=state)
         if self.fetch_all_button is not None:
@@ -3205,7 +3329,15 @@ class RiskCalculatorApp(tk.Tk):
         try:
             row_id, status, result = self.quote_messages.get_nowait()
         except queue.Empty:
-            self.after(100, self._poll_quote_result)
+            if self.quote_busy:
+                self.after(100, self._poll_quote_result)
+            return
+        if self.quote_request_cancelled:
+            if status in ("one", "batch_done"):
+                self._set_fetch_busy(False)
+                self.quote_request_cancelled = False
+            else:
+                self.after(100, self._poll_quote_result)
             return
         if status == "one":
             self._set_fetch_busy(False)
@@ -3231,7 +3363,6 @@ class RiskCalculatorApp(tk.Tk):
                     self.status_var.set(
                         f"Updated Yahoo price and historical data for {result.row_id}."
                     )
-            self.after(100, self._poll_quote_result)
             return
         if status == "batch_item":
             if isinstance(result, YahooDataResult):
@@ -3262,7 +3393,15 @@ class RiskCalculatorApp(tk.Tk):
             elif portfolio_suggestion:
                 self._generate_portfolio_settings_checked()
             elif self.notebook.select() == str(self.settings_tab):
-                self._main_tab_changed()
+                if self.batch_errors:
+                    self._show_settings_hint(
+                        "Yahoo refresh incomplete; no settings regenerated.\n\n"
+                        + "\n".join(self.batch_errors)
+                        + "\n\nExisting complete snapshots were kept. Retry the refresh "
+                        "or explicitly generate from the retained data."
+                    )
+                else:
+                    self._main_tab_changed()
             if self.batch_errors:
                 self.status_var.set(
                     f"Yahoo data fetched with {len(self.batch_errors)} incomplete allocation(s)."
@@ -3299,8 +3438,7 @@ class RiskCalculatorApp(tk.Tk):
         quote = result.quote
         if (
             result.history is None
-            and self.history_sources.get(row_id) == "MT5 CSV"
-            and self.history_bars.get(row_id)
+            and row_id in self.historical_stresses
             and row_id in self.quotes
         ):
             quote = self.quotes[row_id]
@@ -3337,7 +3475,9 @@ class RiskCalculatorApp(tk.Tk):
             self._update_stress_input_states()
         if refresh_settings:
             self._calculate_portfolio(show_error=False)
-            if self.notebook.select() == str(self.settings_tab):
+            if result.error:
+                self.status_var.set(result.error)
+            elif self.notebook.select() == str(self.settings_tab):
                 self._main_tab_changed()
 
     def _begin_yahoo_batch(self, allocation_count: int) -> None:
@@ -3452,19 +3592,25 @@ class RiskCalculatorApp(tk.Tk):
         is_long = self.position_direction_var.get() == "Long (price falls)"
         spread_points, slippage_points, _ = self._transaction_costs()
         rows: list[
-            tuple[str, str, Decimal, int, Decimal, Decimal, str, str, int, str]
+            tuple[str, str, Decimal, int, Decimal, Decimal, str, str, int, str, str]
         ] = []
         missing: list[str] = []
         total_estimated_loss = ZERO
         account_currency = self.currency_var.get().strip().upper()
+        candidate_limit = positive_integer(
+            self.compare_trades_var.get(), "Max Trades candidates"
+        )
+        if candidate_limit > 20:
+            raise ValueError("Compare at most 20 Max Trades values.")
 
         for row_id, allocation_result in self.allocation_results.items():
             allocation = allocation_result.allocation
+            allocation_label = f"{allocation.index} [{row_id}]"
             quote_data = self.quotes.get(row_id)
             contract = self._contract_inputs_for_allocation(row_id)
             _, _, commission_per_lot = self._transaction_costs(contract)
             if quote_data is None:
-                missing.append(f"{allocation.index}: market reference price not loaded")
+                missing.append(f"{allocation_label}: market reference price not loaded")
                 continue
 
             required = (
@@ -3478,18 +3624,21 @@ class RiskCalculatorApp(tk.Tk):
                 missing_fields.append("points_per_pip")
             if missing_fields:
                 missing.append(
-                    f"{allocation.index}: missing MT5 "
+                    f"{allocation_label}: missing MT5 "
                     + ", ".join(missing_fields)
                 )
                 continue
 
             contract_currency = contract.get("contract_currency", "").strip().upper()
+            if not account_currency:
+                missing.append(f"{allocation_label}: missing account currency")
+                continue
             if not contract_currency:
-                missing.append(f"{allocation.index}: missing point-value currency")
+                missing.append(f"{allocation_label}: missing point-value currency")
                 continue
             if account_currency and contract_currency != account_currency:
                 missing.append(
-                    f"{allocation.index}: point-value currency {contract_currency} "
+                    f"{allocation_label}: point-value currency {contract_currency} "
                     f"does not match account currency {account_currency}"
                 )
                 continue
@@ -3515,16 +3664,16 @@ class RiskCalculatorApp(tk.Tk):
                     else None
                 )
             except ValueError as error:
-                missing.append(f"{allocation.index}: invalid MT5 contract ({error})")
+                missing.append(f"{allocation_label}: invalid MT5 contract ({error})")
                 continue
             if min(point_value, point_size, lot_increment, minimum_lot) <= ZERO:
                 missing.append(
-                    f"{allocation.index}: MT5 point/volume specifications must be positive"
+                    f"{allocation_label}: MT5 point/volume specifications must be positive"
                 )
                 continue
             if maximum_lot is not None and maximum_lot < minimum_lot:
                 missing.append(
-                    f"{allocation.index}: broker maximum lot is below minimum lot"
+                    f"{allocation_label}: broker maximum lot is below minimum lot"
                 )
                 continue
             market_price = (
@@ -3539,7 +3688,7 @@ class RiskCalculatorApp(tk.Tk):
             if historical_mode:
                 if history is None:
                     missing.append(
-                        f"{allocation.index}: MT5 or Yahoo daily history not loaded"
+                        f"{allocation_label}: MT5 or Yahoo daily history not loaded"
                     )
                     continue
                 row_stress_percent = historical_stress_move(
@@ -3549,9 +3698,11 @@ class RiskCalculatorApp(tk.Tk):
                     history, stress_mode, is_long
                 )
                 history_bars = history.bar_count
-                if not ZERO < row_stress_percent < ONE_HUNDRED:
+                if row_stress_percent <= ZERO or (
+                    is_long and row_stress_percent >= ONE_HUNDRED
+                ):
                     missing.append(
-                        f"{allocation.index}: no valid historical adverse move below 100% "
+                        f"{allocation_label}: no valid historical adverse move "
                         "is available (refresh history for the selected stress mode)"
                     )
                     continue
@@ -3585,6 +3736,7 @@ class RiskCalculatorApp(tk.Tk):
                             slippage_points=slippage_points,
                             commission_per_lot=commission_per_lot,
                             maximum_lot=maximum_lot,
+                            max_trades_limit=candidate_limit,
                         )
                     elif mt5_bars:
                         recommendation = suggest_safe_grid_settings_from_history(
@@ -3604,6 +3756,7 @@ class RiskCalculatorApp(tk.Tk):
                             commission_per_lot=commission_per_lot,
                             is_long=is_long,
                             maximum_lot=maximum_lot,
+                            max_trades_limit=candidate_limit,
                         )
                     else:
                         recommendation = suggest_safe_grid_settings(
@@ -3617,10 +3770,11 @@ class RiskCalculatorApp(tk.Tk):
                             slippage_points=slippage_points,
                             commission_per_lot=commission_per_lot,
                             maximum_lot=maximum_lot,
+                            max_trades_limit=candidate_limit,
                         )
                 except ValueError as error:
                     missing.append(
-                        f"{allocation.index}: no safe MT5 lot/Max Trades combination "
+                        f"{allocation_label}: no safe MT5 lot/Max Trades combination "
                         f"({error})"
                     )
                     continue
@@ -3648,6 +3802,13 @@ class RiskCalculatorApp(tk.Tk):
                     .to_integral_value(rounding=ROUND_FLOOR)
                     * lot_increment
                 )
+                if maximum_lot is not None:
+                    proposed_lot = min(
+                        proposed_lot,
+                        (maximum_lot / lot_increment)
+                        .to_integral_value(rounding=ROUND_FLOOR)
+                        * lot_increment,
+                    )
                 below_minimum = proposed_lot < minimum_lot
                 effective_lot = minimum_lot if below_minimum else proposed_lot
                 loss = calculate_grid_stress(
@@ -3676,6 +3837,7 @@ class RiskCalculatorApp(tk.Tk):
                     observed_date,
                     history_bars,
                     self.history_sources.get(row_id, "Yahoo"),
+                    row_id,
                 )
             )
 
@@ -3696,14 +3858,16 @@ class RiskCalculatorApp(tk.Tk):
             "",
             (
                 "PORTFOLIO SUGGESTION (historical peak-to-trough drawdown; 1.0 multiplier)"
+                if drawdown_mode and is_long
+                else "PORTFOLIO SUGGESTION (historical trough-to-peak rally; 1.0 multiplier)"
                 if drawdown_mode
                 else "PORTFOLIO SUGGESTION (each symbol's worst daily bar; 1.0 multiplier)"
                 if historical_mode
                 else "PORTFOLIO STRESS (shared Step / Max Trades; 1.0 multiplier)"
             ),
             (
-                "Sizes each grid against the largest historical peak-to-trough fall; "
-                "all DCA entries are assumed to remain open until the trough."
+                "Sizes each grid against its largest historical adverse episode; "
+                "all grid entries are assumed to remain open until the adverse extreme."
                 if drawdown_mode
                 else "Uses each allocation's own worst adverse daily OHLC bar; imported MT5 history is preferred, Yahoo 5y is fallback."
                 if historical_mode
@@ -3738,11 +3902,20 @@ class RiskCalculatorApp(tk.Tk):
             observed_date,
             history_bars,
             history_source,
+            allocation_id,
         ) in rows:
             report.append(
                 f"{symbol:<14.14} {robot:<6} {format_decimal(row_percent, 2):>8} "
                 f"{row_trades:>6} {format_decimal(lot):>10} "
                 f"{format_decimal(loss, 2):>12}  {status}"
+            )
+            row_result = self.allocation_results[allocation_id]
+            report.append(
+                f"  Allocation ID: {allocation_id}; capital "
+                f"{format_decimal(row_result.allocation.capital, 2)} {currency}; "
+                f"risk allowance (80%): "
+                f"{format_decimal(row_result.daily_loss_budget * Decimal('0.8'), 2)} "
+                f"{currency}."
             )
             if historical_mode:
                 report.append(
@@ -3828,6 +4001,9 @@ class RiskCalculatorApp(tk.Tk):
         show_errors: bool = True,
         require_complete_portfolio: bool = False,
     ) -> None:
+        self.generated_scenario = None
+        self.generated_output = ""
+        self.output_text.delete("1.0", "end")
         if not self._calculate_portfolio(show_error=show_errors):
             if require_complete_portfolio:
                 raise ValueError(self.status_var.get())
@@ -3860,10 +4036,9 @@ class RiskCalculatorApp(tk.Tk):
         }
         if self.step_type_var.get() == "Fixed pips":
             required_contract_fields["points_per_pip"] = "points per EA pip"
-        if self.stress_mode_var.get() in HISTORICAL_STRESS_MODES:
-            required_contract_fields["contract_currency"] = (
-                "point-value currency (account currency)"
-            )
+        required_contract_fields["contract_currency"] = (
+            "point-value currency (account currency)"
+        )
         missing_contract_fields = [
             description
             for key, description in required_contract_fields.items()
@@ -3875,6 +4050,14 @@ class RiskCalculatorApp(tk.Tk):
                 + ", ".join(missing_contract_fields)
                 + ". Import the MT5 contract CSV and confirm it contains an exact "
                 "or unambiguous row for this broker symbol."
+            )
+        account_currency = self.currency_var.get().strip().upper()
+        value_currency = contract["contract_currency"].strip().upper()
+        if not account_currency or value_currency != account_currency:
+            raise ValueError(
+                "Risk suggestions need point value expressed in the account currency. "
+                "Enter the account currency and matching MT5 contract currency; "
+                "automatic currency conversion is not applied."
             )
         if row_id not in self.quotes:
             raise ValueError(
@@ -3923,6 +4106,8 @@ class RiskCalculatorApp(tk.Tk):
             target_price = decimal_value(
                 self.stress_target_price_var.get(), "Stress target price"
             )
+            if target_price <= ZERO:
+                raise ValueError("Stress target price must be greater than zero.")
             adverse_difference = (
                 price_in_account - target_price
                 if is_long
@@ -3945,14 +4130,17 @@ class RiskCalculatorApp(tk.Tk):
             stress_percent = historical_stress_move(
                 historical_stress, stress_mode, is_long
             )
-            if not ZERO < stress_percent < ONE_HUNDRED:
+            if stress_percent <= ZERO or (
+                is_long and stress_percent >= ONE_HUNDRED
+            ):
                 move_name = (
                     "peak-to-trough drawdown"
                     if drawdown_mode
                     else "daily adverse move"
                 )
                 raise ValueError(
-                    f"No valid historical {move_name} below 100% is available. "
+                    f"No valid historical {move_name} is available "
+                    "(must be positive and, for long positions, below 100%). "
                     "Refresh the history before generating settings."
                 )
             historical_worst_day = historical_stress_period(
@@ -3969,9 +4157,12 @@ class RiskCalculatorApp(tk.Tk):
             stress_percent = decimal_value(
                 self.stress_pct_var.get(), "Adverse stress move percent"
             )
-            if not ZERO < stress_percent < ONE_HUNDRED:
+            if stress_percent <= ZERO or (
+                is_long and stress_percent >= ONE_HUNDRED
+            ):
                 raise ValueError(
-                    "Adverse stress move percent must be greater than 0 and less than 100."
+                    "Adverse stress move percent must be greater than 0 and, "
+                    "for long positions, less than 100."
                 )
             adverse_difference = price_in_account * stress_percent / ONE_HUNDRED
             stress_points = adverse_difference / point_size
@@ -4003,15 +4194,6 @@ class RiskCalculatorApp(tk.Tk):
         if compare_count > 20:
             raise ValueError("Compare at most 20 Max Trades values.")
         if historical_mode:
-            value_currency = contract["contract_currency"].strip().upper()
-            account_currency = self.currency_var.get().strip().upper()
-            if not value_currency or (
-                account_currency and value_currency != account_currency
-            ):
-                raise ValueError(
-                    "Historical risk suggestions need point value expressed in the "
-                    "account currency. Import the MT5 contract CSV with account_currency."
-                )
             mt5_bars = self.history_bars.get(row_id)
             if mt5_bars and not drawdown_mode:
                 suggestion = suggest_safe_grid_settings_from_history(
@@ -4030,6 +4212,7 @@ class RiskCalculatorApp(tk.Tk):
                     commission_per_lot=commission_per_lot,
                     is_long=is_long,
                     maximum_lot=broker_maximum_lot,
+                    max_trades_limit=compare_count,
                 )
             else:
                 suggestion = suggest_safe_grid_settings(
@@ -4047,6 +4230,7 @@ class RiskCalculatorApp(tk.Tk):
                     slippage_points=slippage_points,
                     commission_per_lot=commission_per_lot,
                     maximum_lot=broker_maximum_lot,
+                    max_trades_limit=compare_count,
                 )
             if suggestion.worst_date:
                 historical_worst_day = suggestion.worst_date
@@ -4174,6 +4358,7 @@ class RiskCalculatorApp(tk.Tk):
                     "Magic Number must be unique across configured robots."
                 )
         take_profit_text = self.take_profit_value_var.get().strip()
+        take_profit_value: Decimal | None = None
         if take_profit_text:
             take_profit_value = decimal_value(take_profit_text, "Take Profit Value")
             if take_profit_value <= ZERO:
@@ -4192,6 +4377,7 @@ class RiskCalculatorApp(tk.Tk):
         robot = allocation.robot.upper()
         output = [
             f"SYMBOL / ROBOT: {allocation.index} / {robot}",
+            f"Allocation ID: {row_id}",
             f"Market reference ({self.history_sources.get(row_id, 'Yahoo')}): "
             f"{yahoo_symbol} = {format_decimal(price_in_account)} "
             f"{quote_currency} ({quote_time})",
@@ -4218,8 +4404,8 @@ class RiskCalculatorApp(tk.Tk):
             output.extend(
                 [
                     (
-                        "Historical basis: largest peak-to-trough move. All grid entries "
-                        "are assumed to remain open until the trough; intermediate "
+                        "Historical basis: largest adverse historical episode. All grid entries "
+                        "are assumed to remain open until the adverse extreme; intermediate "
                         "take-profit closes are not credited."
                         if drawdown_mode
                         else "Historical basis: independent daily OHLC shocks. MT5 bars are "
@@ -4369,10 +4555,17 @@ class RiskCalculatorApp(tk.Tk):
                 ]
             )
         else:
+            assert take_profit_value is not None
             if self.take_profit_type_var.get() == "Fixed pips":
-                take_profit_points = take_profit_value * decimal_value(
-                    contract["points_per_pip"],
-                    f"{allocation.index} points per EA pip",
+                points_per_pip_text = contract["points_per_pip"].strip()
+                take_profit_points = (
+                    take_profit_value
+                    * decimal_value(
+                        points_per_pip_text,
+                        f"{allocation.index} points per EA pip",
+                    )
+                    if points_per_pip_text
+                    else ZERO
                 )
             else:
                 take_profit_points = (
@@ -4381,51 +4574,88 @@ class RiskCalculatorApp(tk.Tk):
                     / ONE_HUNDRED
                     / point_size
                 )
-            campaign = backtest_historical_grid_campaign(
-                bars=mt5_bars,
-                initial_equity=allocation.capital,
-                point_size=point_size,
-                point_value_per_lot=point_value,
-                step_points=step_points,
-                take_profit_points=take_profit_points,
-                initial_lot=selected_lot,
-                max_trades=selected_trades,
-                multiplier=ONE,
-                spread_points=spread_points,
-                slippage_points=slippage_points,
-                commission_per_lot=commission_per_lot,
-                is_long=is_long,
-            )
-            output.extend(
-                [
-                    "",
-                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION (generic OHLC model)",
-                    f"Bars: {len(mt5_bars)} daily bars; campaign period "
-                    f"{mt5_bars[0].date} to {campaign.end_date}.",
-                    f"Net result: {format_decimal(campaign.net_profit, 2)} "
-                    f"{self.currency_var.get().strip() or 'account currency'} "
-                    f"on allocation equity {format_decimal(campaign.initial_equity, 2)}.",
-                    f"Maximum peak-to-trough equity drawdown: "
-                    f"{format_decimal(campaign.max_drawdown_cash, 2)} "
-                    f"({format_decimal(campaign.max_drawdown_pct, 2)}%), "
-                    f"{campaign.drawdown_peak_date} to {campaign.drawdown_trough_date}.",
-                    f"Worst modeled daily equity loss: "
-                    f"{format_decimal(campaign.worst_daily_loss, 2)} "
-                    f"on {campaign.worst_daily_loss_date}.",
-                    f"Maximum concurrent entries: {campaign.max_open_trades}; "
-                    f"basket TP closes: {campaign.take_profit_count}.",
-                    (
-                        "WARNING: the grid reached Max Trades while price crossed "
-                        "the next entry level."
-                        if campaign.grid_exhausted
-                        else "The grid did not cross its next entry level after "
-                        "reaching Max Trades."
-                    ),
-                    "This is one campaign only: after its basket TP, the model "
-                    "does not reopen without an unknown EA signal.",
-                    "",
-                ]
-            )
+            if take_profit_points <= ZERO:
+                output.extend(
+                    [
+                        "",
+                        "CHRONOLOGICAL GRID CAMPAIGN SIMULATION: not run; "
+                        "a positive points-per-pip value is required for "
+                        "fixed-pips Take Profit.",
+                    ]
+                )
+            else:
+                campaign = backtest_historical_grid_campaign(
+                    bars=mt5_bars,
+                    initial_equity=allocation.capital,
+                    point_size=point_size,
+                    point_value_per_lot=point_value,
+                    step_points=step_points,
+                    take_profit_points=take_profit_points,
+                    initial_lot=selected_lot,
+                    max_trades=selected_trades,
+                    multiplier=ONE,
+                    spread_points=spread_points,
+                    slippage_points=slippage_points,
+                    commission_per_lot=commission_per_lot,
+                    is_long=is_long,
+                )
+                output.extend(
+                    [
+                        "",
+                        "CHRONOLOGICAL GRID CAMPAIGN SIMULATION "
+                        "(generic OHLC model)",
+                        f"Bars: {len(mt5_bars)} daily bars; campaign period "
+                        f"{mt5_bars[0].date} to {campaign.end_date}.",
+                        f"Net result: {format_decimal(campaign.net_profit, 2)} "
+                        f"{self.currency_var.get().strip() or 'account currency'} "
+                        f"on allocation equity "
+                        f"{format_decimal(campaign.initial_equity, 2)}.",
+                        f"Maximum peak-to-trough equity drawdown: "
+                        f"{format_decimal(campaign.max_drawdown_cash, 2)} "
+                        f"{self.currency_var.get().strip() or 'account currency'}, "
+                        f"{campaign.drawdown_peak_date} to "
+                        f"{campaign.drawdown_trough_date}.",
+                        f"Maximum percentage equity drawdown: "
+                        f"{format_decimal(campaign.max_drawdown_pct, 2)}% "
+                        "(tracked independently of the cash maximum).",
+                        f"Worst modeled daily equity loss: "
+                        f"{format_decimal(campaign.worst_daily_loss, 2)} "
+                        f"on {campaign.worst_daily_loss_date}.",
+                        (
+                            "Daily allowance check (80% reserved budget): PASS."
+                            if campaign.worst_daily_loss
+                            <= allocation_result.daily_loss_budget * Decimal("0.8")
+                            else "WARNING: modeled daily loss exceeds the "
+                            "80%-reserved allocation budget."
+                        ),
+                        f"Maximum concurrent entries: "
+                        f"{campaign.max_open_trades}; basket TP closes: "
+                        f"{campaign.take_profit_count}.",
+                        (
+                            "WARNING: the grid reached Max Trades while price "
+                            "crossed the next entry level."
+                            if campaign.grid_exhausted
+                            else "The grid did not cross its next entry level "
+                            "after reaching Max Trades."
+                        ),
+                        "This is one campaign only: the model does not create "
+                        "another campaign after TP because the EA entry signal "
+                        "is unknown.",
+                        "Execution assumption: market-on-threshold entries; "
+                        "gaps fill at the daily open and reanchor the next step. "
+                        "An opening gap beyond basket TP closes at that open "
+                        "before later intraday moves. This is not a pending-order model.",
+                        (
+                            "WARNING: history has missing daily opens; those bars "
+                            "use the previous close clamped to their high/low range. "
+                            "Gap execution is approximate; reimport MT5 OHLC data."
+                            if any(bar.open is None for bar in mt5_bars[1:])
+                            else "Daily opens are available for gap modeling; "
+                            "intraday order still uses the adverse-first assumption."
+                        ),
+                        "",
+                    ]
+                )
         portfolio_report = self._portfolio_stress_report(
             row_id,
             step_type,
@@ -4492,9 +4722,25 @@ class RiskCalculatorApp(tk.Tk):
         self.output_text.delete("1.0", "end")
         self.output_text.insert("1.0", "\n".join(output))
         self.magic_assignments[row_id] = magic_number
+        self.generated_output = "\n".join(output).strip()
+        self.generated_scenario = self._scenario_data()
         self.status_var.set(
             f"Settings generated for {allocation.index} / {robot}; review broker units."
         )
+
+    def _validated_generated_output(self) -> str:
+        if self.generated_scenario is None:
+            raise ValueError("Generate candidate settings first.")
+        content = self.output_text.get("1.0", "end").strip()
+        if (
+            content != self.generated_output
+            or self._scenario_data() != self.generated_scenario
+        ):
+            raise ValueError(
+                "Inputs, market data, selection, or report text have changed. "
+                "Regenerate candidate settings before copying or exporting."
+            )
+        return content
 
     def _copy_output(self) -> None:
         content = self.output_text.get("1.0", "end").strip()
@@ -4505,12 +4751,24 @@ class RiskCalculatorApp(tk.Tk):
                 parent=self,
             )
             return
+        if self.generated_scenario is not None:
+            try:
+                content = self._validated_generated_output()
+            except ValueError as error:
+                self.status_var.set("Settings copy blocked; regenerate candidate settings.")
+                messagebox.showerror("Cannot copy outdated settings", str(error), parent=self)
+                return
         self.clipboard_clear()
         self.clipboard_append(content)
         self.status_var.set("Settings copied to clipboard.")
 
     def _export_set_template(self) -> None:
-        content = self.output_text.get("1.0", "end").strip()
+        try:
+            content = self._validated_generated_output()
+        except ValueError as error:
+            self.status_var.set("MT5 .set export blocked; regenerate candidate settings.")
+            messagebox.showerror("Cannot export settings", str(error), parent=self)
+            return
         selected_start = next(
             (
                 line

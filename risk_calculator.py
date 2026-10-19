@@ -5,7 +5,7 @@ Terminal fallback: python risk_calculator.py
 """
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import sys
 from typing import Sequence
 
@@ -57,6 +57,7 @@ class DailyBar:
     close: Decimal
     spread_points: Decimal | None = None
     spread_sample_count: int | None = None
+    open: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -218,7 +219,14 @@ def calculate_historical_stress(
         if (
             not all(value.is_finite() for value in (bar.high, bar.low, bar.close))
             or min(bar.high, bar.low, bar.close) <= ZERO
-            or bar.high < bar.low
+            or not bar.low <= bar.close <= bar.high
+            or (
+                bar.open is not None
+                and (
+                    not bar.open.is_finite()
+                    or not bar.low <= bar.open <= bar.high
+                )
+            )
         ):
             raise ValueError(f"Historical bar {bar.date} contains invalid prices.")
         if bar.spread_points is not None and (
@@ -320,8 +328,8 @@ def calculate_grid_stress(
         raise ValueError("Multiplier must be greater than zero.")
     if max_trades <= 0:
         raise ValueError("Maximum trades must be greater than zero.")
-    if stress_points <= ZERO:
-        raise ValueError("Stress move in points must be greater than zero.")
+    if stress_points < ZERO:
+        raise ValueError("Stress move in points must be non-negative.")
     if daily_budget <= ZERO:
         raise ValueError("Daily budget must be greater than zero.")
     if not ZERO < budget_fraction <= ONE:
@@ -338,7 +346,7 @@ def calculate_grid_stress(
         loss = ZERO
         for trade_index in range(trade_count):
             entry_offset = step_points * trade_index
-            if entry_offset >= stress_points:
+            if entry_offset > stress_points:
                 break
             trade_lot = lot * (multiplier ** trade_index)
             loss += (
@@ -413,8 +421,8 @@ def suggest_safe_grid_settings(
         raise ValueError("Budget fraction must be greater than 0 and at most 1.")
 
     entries_in_stress = int(
-        (stress_points / step_points).to_integral_value(rounding=ROUND_CEILING)
-    )
+        (stress_points / step_points).to_integral_value(rounding=ROUND_FLOOR)
+    ) + 1
     candidate_trades = min(max_trades_limit, max(1, entries_in_stress))
     risk_budget = daily_budget * budget_fraction
 
@@ -543,9 +551,6 @@ def replay_historical_grid(
         if step_points <= ZERO:
             raise ValueError("Converted historical grid step must be positive.")
         stress_points = adverse_price_move / point_size
-        if stress_points <= ZERO:
-            previous_close = bar.close
-            continue
         stress = calculate_grid_stress(
             initial_lot=initial_lot,
             point_value_per_lot=point_value_per_lot,
@@ -574,8 +579,10 @@ def replay_historical_grid(
             worst = candidate
         previous_close = bar.close
 
-    if worst is None:
-        raise ValueError("No valid adverse price movement was found in the history.")
+    if worst is None or worst.estimated_loss == ZERO:
+        raise ValueError(
+            "No modeled price or transaction-cost loss was found in the history."
+        )
     return worst
 
 
@@ -597,8 +604,10 @@ def backtest_historical_grid_campaign(
     """Replay one generic grid campaign in date order using adverse-first OHLC paths.
 
     The campaign opens at the first bar's close, adds fixed-step entries, and
-    closes its basket once the weighted-average take-profit is reached. It does
-    not restart because an unknown EA's entry signal cannot be inferred.
+    closes its basket once the weighted-average take-profit is reached. Entries
+    are market-on-threshold, reanchored to the last fill; gaps fill at the open.
+    Missing opens use the previous close clamped to the bar's range. It does not
+    restart because an unknown EA's entry signal cannot be inferred.
     """
     calculate_historical_stress(bars)
     positive_inputs = (
@@ -611,7 +620,10 @@ def backtest_historical_grid_campaign(
         multiplier,
     )
     if any(not value.is_finite() or value <= ZERO for value in positive_inputs):
-        raise ValueError("Backtest prices, equity, lot, and grid settings must be positive and finite.")
+        raise ValueError(
+            "Backtest prices, equity, lot, and grid settings must be positive "
+            "and finite."
+        )
     if max_trades <= 0:
         raise ValueError("Maximum trades must be greater than zero.")
     if any(
@@ -623,7 +635,9 @@ def backtest_historical_grid_campaign(
     positions: list[tuple[Decimal, Decimal]] = []
     balance = initial_equity
     equity_peak = initial_equity
+    equity_peak_date = bars[0].date
     max_drawdown = ZERO
+    max_drawdown_pct = ZERO
     drawdown_peak_date = bars[0].date
     drawdown_trough_date = bars[0].date
     worst_daily_loss = ZERO
@@ -631,6 +645,7 @@ def backtest_historical_grid_campaign(
     max_open_trades = 0
     take_profit_count = 0
     grid_exhausted = False
+    day_open_equity = initial_equity
 
     def spread_for(bar: DailyBar) -> Decimal:
         return max(
@@ -652,29 +667,57 @@ def backtest_historical_grid_campaign(
         return balance + floating
 
     def observe_equity(value: Decimal, bar_date: str) -> None:
-        nonlocal equity_peak, max_drawdown
+        nonlocal equity_peak, equity_peak_date, max_drawdown, max_drawdown_pct
         nonlocal drawdown_peak_date, drawdown_trough_date
+        nonlocal worst_daily_loss, worst_daily_loss_date
         if value > equity_peak:
             equity_peak = value
-            drawdown_peak_date = bar_date
+            equity_peak_date = bar_date
         drawdown = equity_peak - value
         if drawdown > max_drawdown:
             max_drawdown = drawdown
+            drawdown_peak_date = equity_peak_date
             drawdown_trough_date = bar_date
+        max_drawdown_pct = max(
+            max_drawdown_pct, drawdown * ONE_HUNDRED / equity_peak
+        )
+        daily_loss = max(day_open_equity - value, ZERO)
+        if daily_loss > worst_daily_loss:
+            worst_daily_loss = daily_loss
+            worst_daily_loss_date = bar_date
+
+    def open_position(price: Decimal, bar: DailyBar) -> None:
+        nonlocal balance, max_open_trades
+        observe_equity(equity_at(price), bar.date)
+        lot = initial_lot * (multiplier ** len(positions))
+        positions.append((price, lot))
+        balance -= lot * (
+            point_value_per_lot
+            * (spread_for(bar) + slippage_points)
+            + commission_per_lot
+        )
+        max_open_trades = max(max_open_trades, len(positions))
+        observe_equity(equity_at(price), bar.date)
+
+    def basket_take_profit() -> Decimal:
+        total_lots = sum((lot for _, lot in positions), ZERO)
+        weighted_entry = sum(
+            (entry * lot for entry, lot in positions), ZERO
+        ) / total_lots
+        distance = take_profit_points * point_size
+        return weighted_entry + distance if is_long else weighted_entry - distance
+
+    def close_basket(price: Decimal, bar: DailyBar) -> None:
+        nonlocal balance, take_profit_count
+        balance = equity_at(price)
+        positions.clear()
+        take_profit_count += 1
+        observe_equity(balance, bar.date)
 
     first_bar = bars[0]
-    positions.append((first_bar.close, initial_lot))
-    balance -= initial_lot * (
-        point_value_per_lot
-        * (spread_for(first_bar) + slippage_points)
-        + commission_per_lot
-    )
-    max_open_trades = 1
+    open_position(first_bar.close, first_bar)
     previous_close = first_bar.close
-    day_open_equity = initial_equity
-    opening_loss = max(initial_equity - balance, ZERO)
-    worst_daily_loss = opening_loss
-    observe_equity(balance, first_bar.date)
+    day_open_equity = balance
 
     for bar in bars[1:]:
         if not positions:
@@ -684,6 +727,22 @@ def backtest_historical_grid_campaign(
         step_price = step_points * point_size
         adverse_price = bar.low if is_long else bar.high
         favorable_price = bar.high if is_long else bar.low
+        opening_price = (
+            bar.open
+            if bar.open is not None
+            else min(max(previous_close, bar.low), bar.high)
+        )
+        observe_equity(equity_at(opening_price), bar.date)
+        take_profit_price = basket_take_profit()
+        if (
+            opening_price >= take_profit_price
+            if is_long else opening_price <= take_profit_price
+        ):
+            close_basket(opening_price, bar)
+            day_open_equity = balance
+            previous_close = bar.close
+            continue
+
         next_entry = (
             positions[-1][0] - step_price
             if is_long
@@ -694,18 +753,11 @@ def backtest_historical_grid_campaign(
             adverse_price <= next_entry if is_long else adverse_price >= next_entry
         ):
             fill_price = (
-                min(next_entry, previous_close)
+                min(next_entry, opening_price)
                 if is_long
-                else max(next_entry, previous_close)
+                else max(next_entry, opening_price)
             )
-            lot = initial_lot * (multiplier ** len(positions))
-            positions.append((fill_price, lot))
-            balance -= lot * (
-                point_value_per_lot
-                * (spread_for(bar) + slippage_points)
-                + commission_per_lot
-            )
-            max_open_trades = max(max_open_trades, len(positions))
+            open_position(fill_price, bar)
             next_entry = (
                 positions[-1][0] - step_price
                 if is_long
@@ -717,54 +769,20 @@ def backtest_historical_grid_campaign(
         ):
             grid_exhausted = True
 
-        adverse_equity = equity_at(adverse_price)
-        observe_equity(adverse_equity, bar.date)
-        daily_loss = max(day_open_equity - adverse_equity, ZERO)
-        if daily_loss > worst_daily_loss:
-            worst_daily_loss = daily_loss
-            worst_daily_loss_date = bar.date
-
-        total_lots = sum((lot for _, lot in positions), ZERO)
-        if total_lots > ZERO:
-            weighted_entry = sum(
-                (entry * lot for entry, lot in positions), ZERO
-            ) / total_lots
-            take_profit_price = (
-                weighted_entry + take_profit_points * point_size
-                if is_long
-                else weighted_entry - take_profit_points * point_size
-            )
-            take_profit_hit = (
-                favorable_price >= take_profit_price
-                if is_long
-                else favorable_price <= take_profit_price
-            )
-        else:
-            take_profit_hit = False
-
+        observe_equity(equity_at(adverse_price), bar.date)
+        take_profit_price = basket_take_profit()
+        take_profit_hit = (
+            favorable_price >= take_profit_price
+            if is_long
+            else favorable_price <= take_profit_price
+        )
         if take_profit_hit:
-            balance += sum(
-                (
-                    (take_profit_price - entry if is_long else entry - take_profit_price)
-                    / point_size
-                    * point_value_per_lot
-                    * lot
-                    for entry, lot in positions
-                ),
-                ZERO,
-            )
-            positions.clear()
-            take_profit_count += 1
-            observe_equity(balance, bar.date)
+            close_basket(take_profit_price, bar)
         else:
             observe_equity(equity_at(favorable_price), bar.date)
 
         closing_equity = equity_at(bar.close)
         observe_equity(closing_equity, bar.date)
-        daily_loss = max(day_open_equity - min(adverse_equity, closing_equity), ZERO)
-        if daily_loss > worst_daily_loss:
-            worst_daily_loss = daily_loss
-            worst_daily_loss_date = bar.date
         day_open_equity = closing_equity
         previous_close = bar.close
 
@@ -787,11 +805,7 @@ def backtest_historical_grid_campaign(
         final_equity=final_equity,
         net_profit=final_equity - initial_equity,
         max_drawdown_cash=max_drawdown,
-        max_drawdown_pct=(
-            max_drawdown * ONE_HUNDRED / equity_peak
-            if equity_peak > ZERO
-            else ZERO
-        ),
+        max_drawdown_pct=max_drawdown_pct,
         drawdown_peak_date=drawdown_peak_date,
         drawdown_trough_date=drawdown_trough_date,
         worst_daily_loss=worst_daily_loss,
@@ -874,7 +888,8 @@ def suggest_safe_grid_settings_from_history(
         if step_points > ZERO:
             candidate_trades = max(
                 candidate_trades,
-                int((adverse_points / step_points).to_integral_value(rounding=ROUND_CEILING)),
+                int((adverse_points / step_points).to_integral_value(rounding=ROUND_FLOOR))
+                + 1,
             )
         previous_close = bar.close
     candidate_trades = min(max_trades_limit, max(1, candidate_trades))
