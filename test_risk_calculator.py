@@ -1,20 +1,177 @@
 import unittest
+from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
+import io
+from unittest.mock import patch
 
 from risk_calculator import (
+    Allocation,
     DailyBar,
     backtest_historical_grid_campaign,
     calculate_historical_stress,
     calculate_grid_stress,
+    calculate_portfolio,
     effective_portfolio_risk_cap,
     replay_historical_grid,
+    run_stress_check,
     suggest_safe_grid_settings,
     suggest_safe_grid_settings_from_history,
 )
 
 
+class TerminalStressReportTests(unittest.TestCase):
+    def _run_answers(self, answers: list[str], output: io.StringIO) -> None:
+        allocation = calculate_portfolio(
+            Decimal("100"), Decimal("1"),
+            [Allocation("US500", "DCA", Decimal("100"))],
+        ).allocations[0]
+        with patch("builtins.input", side_effect=answers), redirect_stdout(output):
+            run_stress_check(allocation, "USD")
+
+    def test_negative_step_and_negative_pip_conversion_cannot_cancel_out(self) -> None:
+        for mode in ("1", "2"):
+            with self.subTest(mode=mode):
+                output = io.StringIO()
+                answers = [mode, "1", "1", "-10", "-1", "3"]
+                answers += ["1", "1", "10001", "1", "10"] if mode == "1" else ["0.1", "1", "1"]
+                with self.assertRaisesRegex(ValueError, "Step Value"):
+                    self._run_answers(answers, output)
+                self.assertNotIn("Suggested EA configuration", output.getvalue())
+
+    def test_nonpositive_step_is_rejected_for_both_step_types(self) -> None:
+        for step_type in ("1", "2"):
+            for step in ("0", "-1"):
+                with self.subTest(step_type=step_type, step=step):
+                    with self.assertRaisesRegex(ValueError, "Step Value"):
+                        self._run_answers(["1", "1", step_type, step], io.StringIO())
+
+    def test_nonpositive_points_per_pip_is_rejected_before_conversion(self) -> None:
+        for conversion in ("0", "-1"):
+            with self.subTest(conversion=conversion):
+                with self.assertRaisesRegex(ValueError, "Points per EA pip"):
+                    self._run_answers(["1", "1", "1", "10", conversion], io.StringIO())
+
+    def test_nonpositive_take_profit_is_not_printed_as_a_recommendation(self) -> None:
+        for tp_type in ("1", "2"):
+            for tp in ("0", "-10"):
+                with self.subTest(tp_type=tp_type, tp=tp):
+                    output = io.StringIO()
+                    answers = ["1", "1", "1", "10", "1", "3",
+                               "1", "1", "10001", tp_type, tp]
+                    with self.assertRaisesRegex(ValueError, "Take Profit Value"):
+                        self._run_answers(answers, output)
+                    self.assertNotIn("Suggested EA configuration", output.getvalue())
+
+    def test_valid_percentage_step_and_take_profit_are_preserved(self) -> None:
+        output = io.StringIO()
+        self._run_answers(
+            ["1", "1", "2", "0.5", "100", "0.01", "3",
+             "1", "1", "10001", "2", "0.25"],
+            output,
+        )
+        text = output.getvalue()
+        self.assertIn("Step Type: Enum_percentage_pips", text)
+        self.assertIn("Step Value: 0.5", text)
+        self.assertIn("Take Profit Type: Enum_percentage_pips", text)
+        self.assertIn("Take Profit Value: 0.25", text)
+
+    def _report(self, mode: str, stress: str = "3") -> str:
+        allocation = calculate_portfolio(
+            Decimal("100"), Decimal("1"),
+            [Allocation("US500", "DCA", Decimal("100"))],
+        ).allocations[0]
+        answers = [mode, "1", "1", "10", "1", stress]
+        if mode == "1":
+            answers += ["1", "1", "10001", "1", "10"]
+        else:
+            answers += ["0.1", "1", "1"]
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=answers), redirect_stdout(output):
+            run_stress_check(allocation, "USD")
+        return output.getvalue()
+
+    def test_candidate_and_selected_ceilings_do_not_round_up(self) -> None:
+        output = self._report("1")
+        ceiling = Decimal("0.8") / Decimal("3")
+        self.assertIn(format(ceiling, "f"), output)
+        line = next(line for line in output.splitlines() if line.startswith("Risk:"))
+        displayed = Decimal(line.split()[2])
+        self.assertLessEqual(displayed, ceiling)
+        self.assertNotIn("0.2667", output)
+
+    def test_selected_report_uses_ceiling_lot_not_one_lot_loss(self) -> None:
+        output = self._report("1")
+        self.assertIn("Modeled loss at the lot ceiling", output)
+        self.assertIn("0.80 USD at 3 points adverse", output)
+        self.assertNotIn("3.00 USD at 3 points adverse", output)
+
+    def test_existing_settings_report_preserves_exact_ceiling(self) -> None:
+        output = self._report("2")
+        self.assertIn(
+            "Initial lot ceiling for these settings: "
+            + format(Decimal("0.8") / Decimal("3"), "f"),
+            output,
+        )
+        self.assertIn("Estimated open loss at 3 points: 0.30 USD", output)
+
+    def test_tiny_nonzero_ceiling_is_not_displayed_as_zero(self) -> None:
+        output = self._report("2", stress="100000")
+        self.assertIn("Initial lot ceiling for these settings: 0.000008", output)
+
+    def test_candidate_mode_rejects_zero_stress_without_execution_costs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "positive adverse move"):
+            self._report("1", stress="0")
+
+    def test_zero_loss_check_does_not_claim_a_zero_lot_ceiling(self) -> None:
+        output = self._report("2", stress="0")
+        self.assertIn("not determined by this zero-loss scenario", output)
+        self.assertNotIn("Initial lot ceiling for these settings: 0", output)
+
+
+class PortfolioInputValidationTests(unittest.TestCase):
+    def test_nonfinite_account_or_limit_is_rejected(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            for field in ("account", "limit"):
+                with self.subTest(value=value, field=field):
+                    with self.assertRaisesRegex(ValueError, "finite"):
+                        calculate_portfolio(
+                            Decimal(value) if field == "account" else Decimal("100"),
+                            Decimal(value) if field == "limit" else Decimal("10"),
+                            [Allocation("US500", "DCA", Decimal("50"))],
+                        )
+
+    def test_nonfinite_allocation_is_rejected(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    calculate_portfolio(
+                        Decimal("100"), Decimal("10"),
+                        [Allocation("US500", "DCA", Decimal(value))],
+                    )
+
+    def test_valid_portfolio_keeps_proportional_budgets_and_reserve(self) -> None:
+        result = calculate_portfolio(
+            Decimal("1000"), Decimal("100"),
+            [Allocation("US500", "DCA", Decimal("250")),
+             Allocation("US100", "RSI", Decimal("500"))],
+        )
+        self.assertEqual(result.allocated_daily_budget, Decimal("75"))
+        self.assertEqual(result.reserved_daily_budget, Decimal("25"))
+        self.assertEqual(result.reserved_capital, Decimal("250"))
+
+
 class HistoricalStressTests(unittest.TestCase):
+    def test_minimum_history_length_must_be_a_positive_integer(self) -> None:
+        bars = [
+            DailyBar("2026-01-01", Decimal("101"), Decimal("99"), Decimal("100"))
+        ]
+        for count in (True, False, 1.5, 0, -1):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    calculate_historical_stress(bars, minimum_bars=count)
+
     def test_finds_largest_adverse_daily_ranges_in_both_directions(self) -> None:
         start = date(2026, 1, 1)
         bars = [
@@ -121,6 +278,74 @@ class HistoricalStressTests(unittest.TestCase):
 
 
 class SafeGridSuggestionTests(unittest.TestCase):
+    def test_maximum_trades_requires_a_positive_integer(self) -> None:
+        for count in (True, False, 1.5, 0, -1):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    calculate_grid_stress(
+                        initial_lot=Decimal("1"), point_value_per_lot=Decimal("1"),
+                        step_points=Decimal("10"), multiplier=Decimal("1"),
+                        max_trades=count, stress_points=Decimal("20"),
+                        daily_budget=Decimal("100"),
+                    )
+
+    def test_candidate_limit_requires_a_positive_integer(self) -> None:
+        bars = [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal("101"), Decimal("99"), Decimal("100"),
+            ) for index in range(20)
+        ]
+        for count in (True, False, 1.5, 0, -1):
+            for historical in (False, True):
+                with self.subTest(count=count, historical=historical):
+                    common = dict(
+                        point_value_per_lot=Decimal("1"), daily_budget=Decimal("100"),
+                        lot_step=Decimal("0.01"), minimum_lot=Decimal("0.01"),
+                        max_trades_limit=count,
+                    )
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        if historical:
+                            suggest_safe_grid_settings_from_history(
+                                bars=bars, point_size=Decimal("1"),
+                                step_value=Decimal("10"), step_is_percentage=False,
+                                **common,
+                            )
+                        else:
+                            suggest_safe_grid_settings(
+                                stress_points=Decimal("20"), step_points=Decimal("10"),
+                                **common,
+                            )
+
+    def test_historical_replays_require_integer_trade_counts(self) -> None:
+        bars = [
+            DailyBar(
+                (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                Decimal("101"), Decimal("99"), Decimal("100"),
+            ) for index in range(20)
+        ]
+        for count in (True, False, 1.5, 0, -1):
+            for campaign in (False, True):
+                with self.subTest(count=count, campaign=campaign):
+                    common = dict(
+                        bars=bars, point_size=Decimal("1"),
+                        point_value_per_lot=Decimal("1"),
+                        initial_lot=Decimal("1"), max_trades=count,
+                    )
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        if campaign:
+                            backtest_historical_grid_campaign(
+                                initial_equity=Decimal("1000"),
+                                step_points=Decimal("10"),
+                                take_profit_points=Decimal("5"), **common,
+                            )
+                        else:
+                            replay_historical_grid(
+                                step_value=Decimal("10"), step_is_percentage=False,
+                                multiplier=Decimal("1"), daily_budget=Decimal("100"),
+                                **common,
+                            )
+
     def test_endpoint_entry_costs_can_reduce_the_suggested_trade_count(self) -> None:
         result = suggest_safe_grid_settings(
             stress_points=Decimal("10"),
@@ -218,6 +443,79 @@ class SafeGridSuggestionTests(unittest.TestCase):
             )
 
 
+class GridStressAccumulationTests(unittest.TestCase):
+    def test_zero_loss_keeps_existing_undetermined_ceiling_semantics(self) -> None:
+        result = calculate_grid_stress(
+            initial_lot=Decimal("1"), point_value_per_lot=Decimal("1"),
+            step_points=Decimal("10"), multiplier=Decimal("2"),
+            max_trades=100, stress_points=Decimal("0"),
+            daily_budget=Decimal("100"),
+        )
+        self.assertEqual(result.estimated_loss, Decimal("0"))
+        self.assertEqual(result.recommended_max_lot, Decimal("0"))
+        self.assertEqual(result.max_trades_within_budget, 100)
+
+    def test_matches_independent_prefix_calculations(self) -> None:
+        for multiplier in ("0.5", "1", "1.7"):
+            for stress in ("0", "10", "25", "100"):
+                for budget in ("0.01", "3", "1000"):
+                    with self.subTest(multiplier=multiplier, stress=stress, budget=budget):
+                        inputs = dict(
+                            initial_lot=Decimal("0.13"),
+                            point_value_per_lot=Decimal("1.23"),
+                            step_points=Decimal("10"),
+                            multiplier=Decimal(multiplier), max_trades=8,
+                            stress_points=Decimal(stress), daily_budget=Decimal(budget),
+                            spread_points=Decimal("2"), slippage_points=Decimal("0.7"),
+                            commission_per_lot=Decimal("0.5"),
+                        )
+                        def loss(count: int, lot: Decimal) -> Decimal:
+                            total = Decimal("0")
+                            for index in range(count):
+                                offset = inputs["step_points"] * index
+                                if offset > inputs["stress_points"]:
+                                    break
+                                volume = lot * inputs["multiplier"] ** index
+                                total += volume * (
+                                    inputs["point_value_per_lot"] * (
+                                        inputs["stress_points"] - offset
+                                        + inputs["spread_points"] + inputs["slippage_points"]
+                                    ) + inputs["commission_per_lot"]
+                                )
+                            return total
+                        result = calculate_grid_stress(**inputs)
+                        allowance = Decimal(budget) * Decimal("0.8")
+                        feasible = 0
+                        for count in range(1, 9):
+                            if loss(count, inputs["initial_lot"]) > allowance:
+                                break
+                            feasible = count
+                        self.assertEqual(result.estimated_loss, loss(8, inputs["initial_lot"]))
+                        self.assertEqual(result.recommended_max_lot, allowance / loss(8, Decimal("1")))
+                        self.assertEqual(result.max_trades_within_budget, feasible)
+
+    def test_unused_entry_capacity_does_not_increase_loss(self) -> None:
+        result = calculate_grid_stress(
+            initial_lot=Decimal("1"), point_value_per_lot=Decimal("1"),
+            step_points=Decimal("10"), multiplier=Decimal("1"),
+            max_trades=1_000_000, stress_points=Decimal("1"),
+            daily_budget=Decimal("100"),
+        )
+        self.assertEqual(result.estimated_loss, Decimal("1"))
+        self.assertEqual(result.max_trades_within_budget, 1_000_000)
+
+    def test_exact_allowance_and_next_entry_cost(self) -> None:
+        result = calculate_grid_stress(
+            initial_lot=Decimal("1"), point_value_per_lot=Decimal("1"),
+            step_points=Decimal("10"), multiplier=Decimal("1"),
+            max_trades=100, stress_points=Decimal("10"),
+            daily_budget=Decimal("15"), spread_points=Decimal("2"),
+        )
+        self.assertEqual(result.loss_budget, Decimal("12"))
+        self.assertEqual(result.estimated_loss, Decimal("14"))
+        self.assertEqual(result.max_trades_within_budget, 1)
+
+
 class TransactionCostTests(unittest.TestCase):
     def test_charges_entry_costs_when_stress_exactly_reaches_next_level(self) -> None:
         result = calculate_grid_stress(
@@ -273,6 +571,35 @@ class TransactionCostTests(unittest.TestCase):
 
 
 class HistoricalGridReplayTests(unittest.TestCase):
+    def test_replay_rejects_invalid_costs_before_applying_observed_spread(self) -> None:
+        for observed in (None, Decimal("5")):
+            for field in ("spread_points", "slippage_points", "commission_per_lot"):
+                for value in ("-1", "NaN", "Infinity", "-Infinity"):
+                    with self.subTest(observed=observed, field=field, value=value):
+                        bars = [
+                            replace(bar, spread_points=observed) for bar in self._bars()
+                        ]
+                        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+                            replay_historical_grid(
+                                bars=bars, point_size=Decimal("1"),
+                                point_value_per_lot=Decimal("1"),
+                                step_value=Decimal("5"), step_is_percentage=False,
+                                initial_lot=Decimal("0.1"), max_trades=3,
+                                multiplier=Decimal("1"), daily_budget=Decimal("100"),
+                                **{field: Decimal(value)},
+                            )
+
+    def test_configured_spread_above_observed_spread_remains_the_floor(self) -> None:
+        bars = [replace(bar, spread_points=Decimal("2")) for bar in self._bars()]
+        result = replay_historical_grid(
+            bars=bars, point_size=Decimal("1"), point_value_per_lot=Decimal("1"),
+            step_value=Decimal("5"), step_is_percentage=False,
+            initial_lot=Decimal("0.1"), max_trades=3,
+            multiplier=Decimal("1"), daily_budget=Decimal("100"),
+            spread_points=Decimal("5"),
+        )
+        self.assertEqual(result.estimated_loss, Decimal("3.3"))
+
     def test_historical_suggestion_accounts_for_endpoint_entry_costs(self) -> None:
         bars = [
             DailyBar(

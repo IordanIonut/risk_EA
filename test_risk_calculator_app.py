@@ -26,6 +26,64 @@ historical_stress_move = APP["historical_stress_move"]
 legacy_historical_mode = APP["LEGACY_HISTORICAL_STRESS_MODE"]
 
 
+class YahooQuoteTests(unittest.TestCase):
+    def _fetch(self, chart: dict):
+        fetch = APP["fetch_yahoo_quote"]
+        with patch.dict(fetch.__globals__, _fetch_yahoo_chart=lambda *args: chart):
+            return fetch("^GSPC")
+
+    def test_fallback_close_must_be_an_array_not_text_or_mapping(self) -> None:
+        for closes in ("123", {"100": 1}, None, 100):
+            with self.subTest(closes=closes):
+                with self.assertRaisesRegex(ValueError, "malformed.*quote"):
+                    self._fetch({"indicators": {"quote": [{"close": closes}]}})
+
+    def test_fallback_quote_container_requires_a_list(self) -> None:
+        for quotes in ({0: {"close": [100]}}, "invalid", 100):
+            with self.subTest(quotes=quotes):
+                with self.assertRaisesRegex(ValueError, "malformed.*quote"):
+                    self._fetch({"indicators": {"quote": quotes}})
+
+    def test_valid_fallback_uses_last_nonempty_close(self) -> None:
+        result = self._fetch({
+            "meta": {"currency": "USD"},
+            "indicators": {"quote": [{"close": [99, None, 101, None]}]},
+        })
+        self.assertEqual(result, (Decimal("101"), "USD", "^GSPC", "time unavailable"))
+
+    def test_invalid_supplied_market_time_is_explicitly_rejected(self) -> None:
+        for timestamp in (True, False, "invalid", [], float("inf"), 10**30):
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaisesRegex(ValueError, "invalid.*time"):
+                    self._fetch({"meta": {
+                        "regularMarketPrice": 100, "regularMarketTime": timestamp,
+                    }})
+
+    def test_epoch_market_time_is_not_treated_as_missing(self) -> None:
+        result = self._fetch({"meta": {
+            "regularMarketPrice": 100, "regularMarketTime": 0,
+        }})
+        self.assertNotEqual(result[3], "time unavailable")
+
+    def test_metadata_quote_does_not_require_fallback_arrays(self) -> None:
+        result = self._fetch({
+            "meta": {"regularMarketPrice": 100, "currency": "USD", "symbol": "^GSPC"},
+            "indicators": None,
+        })
+        self.assertEqual(result, (Decimal("100"), "USD", "^GSPC", "time unavailable"))
+
+    def test_malformed_quote_is_delivered_as_a_failed_request(self) -> None:
+        request = APP["RiskCalculatorApp"]._request_yahoo_data
+        with patch.dict(
+            request.__globals__,
+            _fetch_yahoo_chart=lambda *args: {"indicators": {"quote": [{"close": "123"}]}},
+        ):
+            result = request("allocation-1", "^GSPC")
+        self.assertIsNone(result.quote)
+        self.assertIsNone(result.history)
+        self.assertIn("Price request failed", result.error)
+
+
 class YahooHistoryTests(unittest.TestCase):
     def _chart(self) -> dict:
         return {

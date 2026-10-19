@@ -121,6 +121,8 @@ def calculate_portfolio(
     allocations: Sequence[Allocation],
 ) -> PortfolioResult:
     """Distribute the account's daily cash limit in proportion to allocated capital."""
+    if not account_capital.is_finite() or not daily_loss_limit.is_finite():
+        raise ValueError("Account capital and daily loss limit must be finite numbers.")
     if account_capital <= ZERO:
         raise ValueError("Account capital must be greater than zero.")
     if daily_loss_limit <= ZERO:
@@ -131,6 +133,8 @@ def calculate_portfolio(
         raise ValueError("Add at least one index/robot allocation.")
 
     for item in allocations:
+        if not item.capital.is_finite():
+            raise ValueError("Each allocation capital must be a finite number.")
         if not item.index.strip() or not item.robot.strip():
             raise ValueError("Index and robot names cannot be empty.")
         if item.capital <= ZERO:
@@ -189,12 +193,16 @@ def calculate_historical_stress(
     minimum_bars: int = 20,
 ) -> HistoricalStress:
     """Find worst daily shocks and peak-to-trough moves over the history."""
+    if (
+        isinstance(minimum_bars, bool)
+        or not isinstance(minimum_bars, int)
+        or minimum_bars <= 0
+    ):
+        raise ValueError("Minimum history length must be a positive integer.")
     if len(bars) < minimum_bars:
         raise ValueError(
             f"At least {minimum_bars} valid daily bars are required; received {len(bars)}."
         )
-    if minimum_bars <= 0:
-        raise ValueError("Minimum history length must be greater than zero.")
 
     long_move = ZERO
     short_move = ZERO
@@ -326,8 +334,8 @@ def calculate_grid_stress(
         raise ValueError("Step in points must be greater than zero.")
     if multiplier <= ZERO:
         raise ValueError("Multiplier must be greater than zero.")
-    if max_trades <= 0:
-        raise ValueError("Maximum trades must be greater than zero.")
+    if isinstance(max_trades, bool) or not isinstance(max_trades, int) or max_trades <= 0:
+        raise ValueError("Maximum trades must be a positive integer.")
     if stress_points < ZERO:
         raise ValueError("Stress move in points must be non-negative.")
     if daily_budget <= ZERO:
@@ -342,32 +350,30 @@ def calculate_grid_stress(
 
     risk_budget = daily_budget * budget_fraction
 
-    def loss_for(trade_count: int, lot: Decimal) -> Decimal:
-        loss = ZERO
-        for trade_index in range(trade_count):
-            entry_offset = step_points * trade_index
-            if entry_offset > stress_points:
-                break
-            trade_lot = lot * (multiplier ** trade_index)
-            loss += (
-                trade_lot
-                * (
-                    point_value_per_lot
-                    * (stress_points - entry_offset + spread_points + slippage_points)
-                    + commission_per_lot
-                )
-            )
-        return loss
-
-    estimated_loss = loss_for(max_trades, initial_lot)
-    unit_lot_loss = loss_for(max_trades, Decimal("1"))
-    recommended_max_lot = risk_budget / unit_lot_loss if unit_lot_loss > ZERO else ZERO
-
+    estimated_loss = ZERO
+    unit_lot_loss = ZERO
     feasible_trades = 0
-    for trade_count in range(1, max_trades + 1):
-        if loss_for(trade_count, initial_lot) > risk_budget:
+    budget_exceeded = False
+    for trade_index in range(max_trades):
+        entry_offset = step_points * trade_index
+        if entry_offset > stress_points:
             break
-        feasible_trades = trade_count
+        volume_factor = multiplier ** trade_index
+        trade_lot = initial_lot * volume_factor
+        loss_per_lot = (
+            point_value_per_lot
+            * (stress_points - entry_offset + spread_points + slippage_points)
+            + commission_per_lot
+        )
+        estimated_loss += trade_lot * loss_per_lot
+        unit_lot_loss += volume_factor * loss_per_lot
+        if estimated_loss > risk_budget:
+            budget_exceeded = True
+        if not budget_exceeded:
+            feasible_trades = trade_index + 1
+    if not budget_exceeded:
+        feasible_trades = max_trades
+    recommended_max_lot = risk_budget / unit_lot_loss if unit_lot_loss > ZERO else ZERO
 
     return StressResult(
         estimated_loss=estimated_loss,
@@ -415,8 +421,12 @@ def suggest_safe_grid_settings(
         not maximum_lot.is_finite() or maximum_lot < minimum_lot
     ):
         raise ValueError("Broker maximum lot must be finite and at least the minimum lot.")
-    if max_trades_limit <= 0:
-        raise ValueError("Max Trades limit must be greater than zero.")
+    if (
+        isinstance(max_trades_limit, bool)
+        or not isinstance(max_trades_limit, int)
+        or max_trades_limit <= 0
+    ):
+        raise ValueError("Max Trades limit must be a positive integer.")
     if not ZERO < budget_fraction <= ONE:
         raise ValueError("Budget fraction must be greater than 0 and at most 1.")
 
@@ -530,6 +540,11 @@ def replay_historical_grid(
 ) -> HistoricalGridStress:
     """Replay each daily bar as an independent adverse shock, not an EA backtest."""
     calculate_historical_stress(bars)
+    if any(
+        not value.is_finite() or value < ZERO
+        for value in (spread_points, slippage_points, commission_per_lot)
+    ):
+        raise ValueError("Spread, slippage, and commission must be finite and non-negative.")
     if not point_size.is_finite() or point_size <= ZERO:
         raise ValueError("MT5 point size must be a finite positive number.")
     if not step_value.is_finite() or step_value <= ZERO:
@@ -624,8 +639,8 @@ def backtest_historical_grid_campaign(
             "Backtest prices, equity, lot, and grid settings must be positive "
             "and finite."
         )
-    if max_trades <= 0:
-        raise ValueError("Maximum trades must be greater than zero.")
+    if isinstance(max_trades, bool) or not isinstance(max_trades, int) or max_trades <= 0:
+        raise ValueError("Maximum trades must be a positive integer.")
     if any(
         not value.is_finite() or value < ZERO
         for value in (spread_points, slippage_points, commission_per_lot)
@@ -868,8 +883,12 @@ def suggest_safe_grid_settings_from_history(
         for value in (spread_points, slippage_points, commission_per_lot)
     ):
         raise ValueError("Spread, slippage, and commission must be finite and non-negative.")
-    if max_trades_limit <= 0:
-        raise ValueError("Max Trades limit must be greater than zero.")
+    if (
+        isinstance(max_trades_limit, bool)
+        or not isinstance(max_trades_limit, int)
+        or max_trades_limit <= 0
+    ):
+        raise ValueError("Max Trades limit must be a positive integer.")
 
     candidate_trades = 0
     previous_close: Decimal | None = None
@@ -1054,10 +1073,14 @@ def run_stress_check(
         print("Choose 1 or 2.")
 
     step_value = parse_decimal("Step Value for the EA: ")
+    if step_value <= ZERO:
+        raise ValueError("Step Value must be greater than zero.")
     if step_type_choice == "1":
         points_per_pip = parse_decimal(
             "How many MT5 points equal 1 EA pip for this symbol? "
         )
+        if points_per_pip <= ZERO:
+            raise ValueError("Points per EA pip must be greater than zero.")
         step_points = step_value * points_per_pip
         step_type_name = "enum_fixed_pips"
     else:
@@ -1089,6 +1112,11 @@ def run_stress_check(
     )
 
     if mode == "1":
+        if stress_points <= ZERO:
+            raise ValueError(
+                "A positive adverse move is required to find a finite lot ceiling "
+                "when execution costs are not modeled."
+            )
         candidate_limit = read_positive_integer(
             "How many Max Trades values should I compare? (1-20): "
         )
@@ -1112,7 +1140,7 @@ def run_stress_check(
             )
             print(
                 f"{max_trades:>12} {'Fixed lots':>14} {ONE:>12} "
-                f"{candidate.recommended_max_lot:>18.4f}"
+                f"{candidate.recommended_max_lot:>18f}"
             )
 
         selected_trades = read_positive_integer(
@@ -1145,6 +1173,8 @@ def run_stress_check(
                 break
             print("Choose 1 or 2.")
         take_profit_value = parse_decimal("Take Profit Value for the EA: ")
+        if take_profit_value <= ZERO:
+            raise ValueError("Take Profit Value must be greater than zero.")
         take_profit_type = (
             "enum_fixed_pips"
             if take_profit_choice == "1"
@@ -1179,7 +1209,7 @@ def run_stress_check(
         print(f"Take Profit Value: {take_profit_value}")
         print("Risk Type: Fixed lots")
         print(
-            f"Risk: <= {selected.recommended_max_lot:.4f} "
+            f"Risk: <= {selected.recommended_max_lot:f} "
             "(round down to broker volume step)"
         )
         print("Multiplier Factor: 1.0")
@@ -1196,9 +1226,18 @@ def run_stress_check(
             print("RSI Period: 14 (backtest starting value)")
             print("Show Invested Money: true")
 
+        ceiling_stress = calculate_grid_stress(
+            initial_lot=selected.recommended_max_lot,
+            point_value_per_lot=point_value,
+            step_points=step_points,
+            multiplier=ONE,
+            max_trades=selected_trades,
+            stress_points=stress_points,
+            daily_budget=allocation.daily_loss_budget,
+        )
         print(
-            f"\nEstimated modeled loss for this setting: "
-            f"{money(selected.estimated_loss)} {currency} at "
+            f"\nModeled loss at the lot ceiling (before broker rounding): "
+            f"{money(ceiling_stress.estimated_loss)} {currency} at "
             f"{stress_points} points adverse."
         )
     else:
@@ -1218,10 +1257,16 @@ def run_stress_check(
             f"Estimated open loss at {stress_points} points: "
             f"{money(result.estimated_loss)} {currency}"
         )
-        print(
-            f"Initial lot ceiling for these settings: "
-            f"{result.recommended_max_lot:.4f}"
-        )
+        if result.estimated_loss == ZERO:
+            print(
+                "Initial lot ceiling: not determined by this zero-loss scenario. "
+                "Use a positive adverse move; execution costs are not modeled."
+            )
+        else:
+            print(
+                f"Initial lot ceiling for these settings: "
+                f"{result.recommended_max_lot:f} (round down to broker volume step)"
+            )
         print(
             f"Maximum trades within the 80% allowance at this lot: "
             f"{result.max_trades_within_budget} of {max_trades}"

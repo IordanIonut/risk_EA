@@ -333,11 +333,15 @@ def fetch_yahoo_quote(symbol: str) -> tuple[Decimal, str, str, str]:
     if price is None:
         indicators = chart_result.get("indicators", {})
         quote_data = indicators.get("quote", []) if isinstance(indicators, dict) else []
+        if not isinstance(quote_data, list):
+            raise ValueError(f"Yahoo Finance returned malformed fallback quote data for {symbol}.")
         closes = (
             quote_data[0].get("close", [])
             if quote_data and isinstance(quote_data[0], dict)
             else []
         )
+        if not isinstance(closes, list):
+            raise ValueError(f"Yahoo Finance returned malformed fallback quote prices for {symbol}.")
         price = next((item for item in reversed(closes) if item is not None), None)
     if price is None:
         raise ValueError(f"Yahoo Finance did not return a current price for {symbol}.")
@@ -349,11 +353,18 @@ def fetch_yahoo_quote(symbol: str) -> tuple[Decimal, str, str, str]:
         raise ValueError(f"Yahoo Finance returned an invalid price for {symbol}.")
 
     timestamp = metadata.get("regularMarketTime")
-    time_text = (
-        datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
-        if timestamp
-        else "time unavailable"
-    )
+    time_text = "time unavailable"
+    if timestamp is not None:
+        try:
+            if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+                raise ValueError("Expected a numeric Unix timestamp.")
+            time_text = datetime.fromtimestamp(
+                timestamp, timezone.utc
+            ).astimezone().strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Yahoo Finance returned an invalid quote time for {symbol}."
+            ) from error
     return (
         price_value,
         str(metadata.get("currency") or "currency unavailable"),

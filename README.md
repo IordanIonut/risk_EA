@@ -9,6 +9,12 @@ Aplicație desktop pentru estimarea bugetelor de risc și dimensionarea unor set
 - Teste: `py -m unittest -v`.
 - Calculatorul în terminal rămâne disponibil prin `py risk_calculator.py`.
 
+În terminal, plafonul lotului este afișat cu precizia Decimal calculată, fără rotunjire suplimentară la patru zecimale. Rotunjește în jos la pasul de volum și verifică volumul minim/maxim al brokerului; terminalul nu importă aceste limite. Pierderea pentru recomandarea selectată este calculată la plafonul lotului, înainte de rotunjirea la pasul brokerului, nu la 1 lot. Modul de căutare cere o mișcare adversă pozitivă; verificarea cu mișcare zero nu determină un plafon de lot, deoarece calculatorul din terminal nu include costurile de execuție.
+
+Step Value și conversia puncte per pip trebuie să fie fiecare strict pozitive, înainte de conversie; două valori negative nu formează un pas valid chiar dacă produsul lor este pozitiv. Configurația propusă în terminal cere și Take Profit Value strict pozitiv, atât în pips, cât și procentual. Valorile valide sunt păstrate, nu optimizate automat.
+
+Motorul de calcul respinge explicit capitalul și limitele de pierdere nefinite (`NaN`, infinit), inclusiv capitalul alocărilor. Numărul maxim de tranzacții, limita candidaților și lungimea minimă a istoricului trebuie să fie întregi strict pozitivi; valorile fracționare sau booleene nu sunt convertite implicit. Aceste verificări se aplică și apelurilor directe ale funcțiilor Python, nu doar formularului.
+
 ## Alocări multiple pe același simbol
 
 Poți avea mai multe instanțe cu același simbol, robot și ticker. Selectorul afișează și identificatorul intern al alocării, pentru a păstra fiecare instanță selectabilă separat. Contractul, capitalul și Magic Number-ul atribuit la generare rămân separate. Raportul indică identificatorul, capitalul și bugetul fiecărei alocări; mesajele despre date lipsă identifică instanța afectată.
@@ -37,6 +43,8 @@ O actualizare Yahoo înlocuiește perechea existentă cotație–istoric numai c
 
 Istoricul Yahoo este respins dacă seriile high/low/close nu au aceeași lungime ca seria timestamp-urilor sau dacă unei bare îi lipsește un preț. Barele incomplete nu sunt eliminate în tăcere, deoarece ar putea ascunde un episod advers. Timestamp-urile invalide sunt raportate cu poziția barei; datele duplicate sau neordonate sunt respinse. Regula celor minimum 20 de bare nu justifică ignorarea barelor invalide din răspuns. În aceste cazuri se aplică protecția pentru actualizări incomplete de mai sus.
 
+Când prețul curent Yahoo lipsește din metadate, fallback-ul acceptă numai o listă de cotații cu o listă `close` și folosește ultimul close diferit de `null`. Un text sau un obiect nu este interpretat ca serie de prețuri. Ora cotației, dacă este furnizată, trebuie să fie un timestamp numeric valid; absența ei este afișată ca `time unavailable`, iar o valoare invalidă oprește cererea cu o eroare explicită.
+
 La încărcarea unui scenariu cu bare MT5, toate statisticile istorice sunt recalculate din acele bare: șocurile zilnice în ambele direcții, datele lor, numărul și perioada barelor, drawdown-ul și raliul. Valorile rezumative salvate nu înlocuiesc istoricul efectiv. Pentru Yahoo, unde scenariul păstrează doar statisticile, acestea rămân un snapshot care trebuie actualizat înainte de utilizare.
 
 Scenariile sunt validate înainte de salvare, cu aceleași reguli folosite la încărcare. Dacă validarea sau înlocuirea fișierului eșuează, apare o eroare, fișierul existent nu este înlocuit și calea scenariului curent nu este schimbată. Datele incomplete care sunt permise la încărcare, precum un Take Profit încă necompletat, pot fi păstrate; valorile invalide trebuie corectate înainte de salvare.
@@ -48,6 +56,8 @@ Un istoric plat poate fi salvat și reîncărcat cu stres zilnic zero și fără
 În fila **Robot settings** poți introduce spread minim și slippage în puncte, un comision round-turn comun de fallback și, opțional, un comision per simbol în valuta contului per 1.00 lot. Când este completat, comisionul per simbol înlocuiește fallback-ul pentru acel simbol; când este gol, se folosește fallback-ul comun. Comisionul per simbol poate fi introdus în contractul simbolului sau citit din coloana opțională `commission_per_lot` din CSV-ul de contracte. Exportatorul MT5 nu poate determina comisionul brokerului; verifică și completează-l conform condițiilor contului.
 
 Spread-ul din setări este pragul de bază pentru toate alocările. Dacă istoricul MT5 importat are `spread_max_points`, plannerul prioritizează această valoare, agregă maximul zilnic pe simbol și folosește valoarea mai mare dintre spread-ul observat și pragul introdus. Fișierele vechi rămân compatibile prin coloana `spread`. Pentru drawdown peak-to-trough folosește maximul observat în întregul istoric. Spread-ul Yahoo nu este disponibil; fără coloana MT5 rămâne valoarea introdusă manual.
+
+Replay-ul zilnic validează costurile configurate înainte de aplicarea spread-ului istoric: spread-ul, slippage-ul și comisionul trebuie să fie finite și nenegative. Un spread istoric valid nu corectează implicit un spread configurat negativ sau nevalid; apelurile directe ale motorului primesc o eroare explicită.
 
 Prioritatea coloanelor de spread se aplică fiecărui rând: `spread_max_points`, `max_spread_points`, `spread_points`, apoi `spread`. O celulă goală permite folosirea următoarei coloane disponibile; o valoare completată, dar invalidă, oprește importul și nu este ignorată.
 
@@ -66,6 +76,8 @@ Această simulare folosește traseul OHLC zilnic presupus „open, mișcarea adv
 Drawdown-ul maxim în bani păstrează vârful și minimul episodului respectiv; o recuperare ulterioară nu schimbă aceste date. Drawdown-ul procentual maxim este urmărit separat, fiecare scădere fiind raportată la vârful equity existent atunci, nu la un maxim ulterior. Cele două maxime pot proveni din episoade diferite. Pierderea zilnică folosește equity-ul de la închiderea barei precedente ca bază și include gap-ul și costurile intrărilor; nu implementează ora de reset sau regulile specifice unei firme prop.
 
 Stresul static include și intrarea care se deschide exact la capătul mișcării adverse: pierderea ei de preț este zero în acel punct, dar costurile nu sunt zero. Și barele fără mișcare pot contribui la stres prin costurile de tranzacționare. Din acest motiv, numărul candidat de intrări sau lotul recomandat pot diferi de versiunile anterioare.
+
+Calculul stresului static acumulează pierderile într-o singură parcurgere a intrărilor atinse, fără recalcularea fiecărui prefix al gridului. Aceasta reduce timpul pentru griduri mari fără schimbarea formulei, costurilor sau regulii de 80%. Numărul maxim de tranzacții încadrate în buget reprezintă capacitatea configurabilă în scenariul testat, nu numărul de poziții efectiv deschise: intrările dincolo de mișcarea testată nu adaugă pierdere.
 
 Barele intraday sunt în prezent agregate pe zi înainte de simulare; deci nu este încă replay M1/M5 și nu poate stabili ordinea reală a mișcărilor în interiorul zilei. După atingerea TP, campania rămâne inactivă pentru restul istoricului; nu sunt generate cicluri noi, deoarece semnalele și condițiile reale ale EA-ului sunt necunoscute. Rezultatul nu modelează marja, swap-ul, execuția reală sau semnalele RSI și nu este echivalent cu Strategy Tester.
 
