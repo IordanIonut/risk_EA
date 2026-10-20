@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from risk_calculator import DailyBar, calculate_historical_stress
+from advanced_risk import default_exposure, default_profile, parse_equity_csv
 
 APP = runpy.run_path(str(Path(__file__).with_name("risk_calculator_app.pyw")))
 APP["RiskCalculatorApp"].AUTOSAVE_ENABLED = False
@@ -28,7 +29,185 @@ historical_stress_move = APP["historical_stress_move"]
 legacy_historical_mode = APP["LEGACY_HISTORICAL_STRESS_MODE"]
 
 
+class PropWebsiteTests(unittest.TestCase):
+    HTML = """
+    <table><tr><th>Stage</th><th>Risk</th></tr>
+    <tr><td>Evaluation</td><td>5,5% daily, 11% total</td></tr>
+    <tr><td>Funded</td><td>4.5% daily, 11% total</td></tr></table>
+    """
+
+    @staticmethod
+    def snapshot():
+        return {
+            "source": "https://example.com/program",
+            "fetched_at": "2026-10-20T00:00:00+00:00",
+            "candidates": APP["extract_prop_website_rules"](PropWebsiteTests.HTML),
+        }
+
+    def test_extracts_stages_without_mixing_them(self) -> None:
+        rows = APP["extract_prop_website_rules"](self.HTML)
+        self.assertEqual([row["daily_percent"] for row in rows], ["5.5", "4.5"])
+        self.assertEqual([row["total_percent"] for row in rows], ["11", "11"])
+        self.assertEqual(rows[0]["stage"], "Evaluation")
+        self.assertIn("5,5% daily", rows[0]["evidence"])
+
+    def test_extracts_separate_named_columns_and_ignores_scripts(self) -> None:
+        html = """
+        <script><table><tr><td>1% daily 99% total</td></tr></table></script>
+        <table><tr><th>Plan</th><th>Daily loss</th><th>Total loss</th></tr>
+        <tr><td>A</td><td><b>4%</b></td><td>10%</td></tr></table>
+        """
+        rows = APP["extract_prop_website_rules"](html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["daily_percent"], "4")
+
+    def test_missing_ambiguous_and_invalid_percentage_rows_are_not_inferred(self) -> None:
+        for html in (
+            "<p>Daily 4%, Total 10%</p>",
+            "<table><tr><td>Plan</td><td>4% daily</td></tr></table>",
+            "<table><tr><th>Daily</th><th>Total</th></tr>"
+            "<tr><td>4% or 5%</td><td>10%</td></tr></table>",
+            "<table><tr><td>Plan</td><td>20% daily, 10% total</td></tr></table>",
+            "<table><tr><td>Plan</td><td>4% daily or 5% daily, 10% total</td>"
+            "</tr></table>",
+        ):
+            with self.subTest(html=html):
+                self.assertEqual(APP["extract_prop_website_rules"](html), [])
+
+    def test_fetch_validates_https_and_returns_source_and_date(self) -> None:
+        fetch = APP["fetch_prop_website"]
+
+        class Response(io.BytesIO):
+            headers = SimpleNamespace(get_content_charset=lambda: "utf-8")
+
+            def geturl(self):
+                return "https://example.com/program"
+
+        with patch.dict(
+            fetch.__globals__, urlopen=lambda *_args, **_kwargs: Response(
+                self.HTML.encode("utf-8")
+            )
+        ):
+            snapshot = fetch("https://example.com/program")
+        self.assertEqual(snapshot["source"], "https://example.com/program")
+        self.assertEqual(len(snapshot["candidates"]), 2)
+        datetime.fromisoformat(snapshot["fetched_at"])
+        for url in ("http://example.com", "https://user:pass@example.com", "file:///x"):
+            with self.assertRaisesRegex(ValueError, "HTTPS"):
+                fetch(url)
+
+    def test_no_table_response_reports_manual_entry_instead_of_default_limits(self) -> None:
+        fetch = APP["fetch_prop_website"]
+
+        class Response(io.BytesIO):
+            headers = SimpleNamespace(get_content_charset=lambda: "utf-8")
+
+            def geturl(self):
+                return "https://example.com/program"
+
+        with patch.dict(
+            fetch.__globals__, urlopen=lambda *_args, **_kwargs: Response(b"<p>Loading</p>")
+        ):
+            with self.assertRaisesRegex(ValueError, "manual entry"):
+                fetch("https://example.com/program")
+
+    def test_invalid_snapshot_is_rejected(self) -> None:
+        snapshot = self.snapshot()
+        snapshot["candidates"][0]["daily_percent"] = "NaN"
+        with self.assertRaisesRegex(ValueError, "finite"):
+            APP["RiskCalculatorApp"]._validate_prop_website_snapshot(snapshot)
+
+    def test_fetch_failure_and_oversized_response_are_explicit(self) -> None:
+        fetch = APP["fetch_prop_website"]
+
+        class Response(io.BytesIO):
+            headers = SimpleNamespace(get_content_charset=lambda: "utf-8")
+
+            def geturl(self):
+                return "https://example.com/program"
+
+        with patch.dict(
+            fetch.__globals__,
+            urlopen=lambda *_args, **_kwargs: Response(b"x" * (2 * 1024 * 1024 + 1)),
+        ):
+            with self.assertRaisesRegex(ValueError, "2 MiB"):
+                fetch("https://example.com/program")
+
+        def offline(*_args, **_kwargs):
+            raise OSError("offline")
+
+        with patch.dict(fetch.__globals__, urlopen=offline):
+            with self.assertRaisesRegex(ValueError, "offline"):
+                fetch("https://example.com/program")
+
+
 class MT5TerminalDataTests(unittest.TestCase):
+    def test_inspection_returns_broker_symbols_when_existing_portfolio_symbol_is_missing(self) -> None:
+        mt5 = SimpleNamespace(
+            terminal_info=lambda: SimpleNamespace(path="MT5", connected=True),
+            account_info=lambda: SimpleNamespace(currency="USD", trade_mode=0),
+            symbols_get=lambda: [SimpleNamespace(name="US500.cash")],
+            symbol_select=lambda *_args: False,
+        )
+        result = APP["inspect_mt5_terminal"](mt5_module=mt5, requested_symbols=("US500",))
+        self.assertEqual(result["symbols"], "US500.cash")
+        self.assertIn("WARNING", result["risk_details"])
+
+    def test_inspection_reads_margin_estimates_and_raw_swap_without_sending_orders(self) -> None:
+        calculate = unittest.mock.Mock(side_effect=[10, 12])
+        mt5 = SimpleNamespace(
+            terminal_info=lambda: SimpleNamespace(path="MT5", connected=True),
+            account_info=lambda: SimpleNamespace(currency="USD", trade_mode=0),
+            symbols_get=lambda: [SimpleNamespace(name="US500")],
+            symbol_select=lambda *_args: True,
+            symbol_info=lambda _symbol: SimpleNamespace(
+                volume_min=.1, swap_long=-2, swap_short=1, swap_mode=1,
+                swap_rollover3days=3, point=.01,
+            ),
+            symbol_info_tick=lambda _symbol: SimpleNamespace(ask=100, bid=99),
+            order_calc_margin=calculate, ORDER_TYPE_BUY=0, ORDER_TYPE_SELL=1,
+        )
+        result = APP["inspect_mt5_terminal"](mt5_module=mt5, requested_symbols=("US500",))
+        self.assertEqual(calculate.call_count, 2)
+        self.assertIn("BUY margin/lot estimate=1.0E+2", result["risk_details"])
+        self.assertIn("SELL margin/lot estimate=1.2E+2", result["risk_details"])
+        self.assertIn("raw swap_long=-2", result["risk_details"])
+        self.assertIn("NOT normalized cash", result["risk_details"])
+
+    def test_inspection_identifies_demo_server_and_lists_exact_symbols_without_login(self) -> None:
+        initialize = unittest.mock.Mock(return_value=True)
+        shutdown = unittest.mock.Mock()
+        mt5 = SimpleNamespace(
+            terminal_info=lambda: SimpleNamespace(path=r"C:\MT5", connected=True),
+            account_info=lambda: SimpleNamespace(
+                company="Demo Broker", server="Demo-01", currency="EUR",
+                trade_mode=0, leverage=30, margin_free=25000,
+            ),
+            symbols_get=lambda: [
+                SimpleNamespace(name="US500.cash"), SimpleNamespace(name="DE40.demo"),
+            ],
+            initialize=initialize, shutdown=shutdown,
+        )
+        status = APP["inspect_mt5_terminal"](r"C:\MT5\terminal64.exe", mt5)
+        initialize.assert_called_once_with(r"C:\MT5\terminal64.exe")
+        shutdown.assert_called_once()
+        self.assertEqual(status["account_type"], "DEMO")
+        self.assertEqual(status["server"], "Demo-01")
+        self.assertEqual(status["symbols"], "DE40.demo\nUS500.cash")
+        self.assertNotIn("login", status)
+
+    def test_inspection_reports_missing_terminal_and_releases_owned_connection(self) -> None:
+        shutdown = unittest.mock.Mock()
+        mt5 = SimpleNamespace(
+            terminal_info=lambda: None,
+            initialize=lambda: True,
+            account_info=lambda: SimpleNamespace(currency="USD"),
+            shutdown=shutdown,
+        )
+        with self.assertRaisesRegex(ValueError, "information is unavailable"):
+            APP["inspect_mt5_terminal"](mt5_module=mt5)
+        shutdown.assert_called_once()
+
     def test_reads_contract_quote_and_five_year_daily_bars_from_terminal_api(self) -> None:
         class Rate(dict):
             dtype = SimpleNamespace(
@@ -1480,6 +1659,549 @@ class ScenarioMigrationTests(unittest.TestCase):
 
 
 class CandidateGenerationTests(unittest.TestCase):
+    def test_mt5_symbol_selection_only_prefills_new_allocation_without_mutating_existing(self) -> None:
+        before = dict(self.app.allocations)
+        self.app.mt5_connection = {"symbols": "US500.cash\nDE40.demo"}
+        self.app._use_mt5_symbol("US500.cash")
+        self.assertEqual(self.app.index_var.get(), "US500.cash")
+        self.assertEqual(self.app.allocations, before)
+        with patch.object(APP["messagebox"], "showerror") as error:
+            self.app._use_mt5_symbol("not returned by broker")
+        error.assert_called_once()
+        self.assertEqual(self.app.index_var.get(), "US500.cash")
+
+    def _enable_advanced_checks(self) -> None:
+        profile = default_profile()
+        profile.update(
+            enabled=True, current_equity="9900", daily_start_equity="10000",
+            daily_start_balance="10000", total_limit_pct="10", high_water_equity="10500",
+            daily_session_date=datetime.now(timezone.utc).date().isoformat(),
+            free_margin="9900", existing_margin="0", stopout_pct="50",
+            idea_limit_pct="2", holding_days="3",
+        )
+        self.app.risk_profile = profile
+        self.app.daily_limit_var.set("5")
+        self.app.limit_mode_var.set("Percent of account")
+        self.app.exposure_inputs[self.row] = {
+            **default_exposure(), "margin_per_lot": "100",
+            "swap_long_debit": "2", "swap_short_debit": "3", "idea_group": "US index",
+        }
+
+    def test_advanced_risk_profile_and_exposure_migrate_and_roundtrip(self) -> None:
+        self._enable_advanced_checks()
+        saved = self.app._scenario_data()
+        self.assertEqual(saved["version"], 14)
+        self.app._apply_scenario(validate_scenario(saved))
+        row = next(iter(self.app.allocations))
+        self.assertEqual(self.app.exposure_inputs[row]["swap_long_debit"], "2")
+        self.assertTrue(self.app.risk_profile["enabled"])
+        old = deepcopy(saved)
+        old["version"] = 13
+        self.app._apply_scenario(validate_scenario(old))
+        self.assertFalse(self.app.risk_profile["enabled"])
+        self.assertEqual(self.app.exposure_inputs[next(iter(self.app.allocations))],
+                         default_exposure())
+
+    def test_version_14_rejects_missing_or_invalid_advanced_fields(self) -> None:
+        saved = self.app._scenario_data()
+        del saved["risk_profile"]
+        with self.assertRaisesRegex(ValueError, "profile"):
+            validate_scenario(saved)
+        saved = self.app._scenario_data()
+        saved["allocations"][0]["exposure_inputs"]["swap_long_debit"] = "-1"
+        with self.assertRaises(ValueError):
+            validate_scenario(saved)
+
+    def test_prepaid_swap_reserve_affects_both_directions_and_missing_cost_blocks(self) -> None:
+        self._enable_advanced_checks()
+        self.app.symbol_commission_per_lot_var.set("7")
+        contract = self.app._contract_inputs_for_allocation(self.row)
+        self.assertEqual(self.app._sizing_costs(self.row, contract)[2], Decimal("13"))
+        self.app.position_direction_var.set("Short (price rises)")
+        self.assertEqual(self.app._sizing_costs(self.row, contract)[2], Decimal("16"))
+        self.app.exposure_inputs[self.row]["swap_short_debit"] = ""
+        with self.assertRaisesRegex(ValueError, "verified swap_short"):
+            self.app._sizing_costs(self.row, contract)
+
+    def test_explicit_equity_rules_tighten_daily_and_total_rooms(self) -> None:
+        self._enable_advanced_checks()
+        self.app.risk_profile["idea_limit_pct"] = "10"
+        limits = self.app._portfolio_risk_limits()
+        self.assertEqual(limits[2:5], (Decimal("400"), Decimal("900"), Decimal("400")))
+        self.app.risk_profile.update(overall_rule="Trailing equity", high_water_equity="10800")
+        limits = self.app._portfolio_risk_limits()
+        self.assertEqual(limits[3:5], (Decimal("100"), Decimal("100")))
+
+    def test_correlated_idea_cap_restricts_candidate_budget_before_sizing(self) -> None:
+        self._enable_advanced_checks()
+        self.app.allocation_percentages[self.row] = Decimal("100")
+        self.assertEqual(self.app._portfolio_risk_limits()[4], Decimal("200"))
+
+    def test_advanced_margin_failure_rejects_candidate_and_blocks_full_suggestion(self) -> None:
+        self._enable_advanced_checks()
+        self.app.exposure_inputs[self.row]["margin_per_lot"] = "100000000"
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("PORTFOLIO VERDICT: REJECTED", report)
+        self.assertIn("free margin", report)
+        self.assertIn("Overnight debit reserve: 6", report)
+        self.assertIn("ADVANCED PROP / MARGIN", report)
+        with self.assertRaisesRegex(ValueError, "advanced constraints"):
+            self.app._generate_settings_checked(show_errors=False, require_complete_portfolio=True)
+
+    def test_advanced_missing_margin_input_is_explicitly_unverified(self) -> None:
+        self._enable_advanced_checks()
+        self.app.exposure_inputs[self.row]["margin_per_lot"] = ""
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("ADVANCED MISSING: US500", report)
+        self.assertIn("margin per lot", report)
+        self.assertIn("PORTFOLIO VERDICT: UNVERIFIED", report)
+
+    def test_exhausted_prop_floor_stops_candidate_generation(self) -> None:
+        self._enable_advanced_checks()
+        self.app.risk_profile["current_equity"] = "9000"
+        with patch.object(APP["messagebox"], "showerror"):
+            self.assertFalse(self.app._calculate_portfolio())
+        self.assertIn("already reached/breached", self.app.status_var.get())
+
+    def test_equity_csv_report_is_saved_with_curve_and_assumptions_not_candidate_approval(self) -> None:
+        self._enable_advanced_checks()
+        samples = parse_equity_csv(
+            "timestamp,balance,equity\n"
+            "2026-10-19T00:00:00Z,10000,10000\n"
+            "2026-10-19T01:00:00Z,10000,9400\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.equity_report_path = str(Path(directory) / "equity_validation.json")
+            report = self.app._evaluate_and_save_equity_curve(samples)
+            saved = json.loads(Path(self.app.equity_report_path).read_text(encoding="utf-8"))
+        self.assertIn("SAMPLED EQUITY VERDICT: BREACHED", report)
+        self.assertIn("NOT the planner candidate", report)
+        self.assertEqual(len(saved["samples"]), 2)
+        self.assertEqual(saved["daily_limit"], "500")
+        self.assertEqual(saved["risk_profile"], self.app.risk_profile)
+
+    def test_enabled_advanced_checks_can_accept_a_fully_specified_manual_stress(self) -> None:
+        self._enable_advanced_checks()
+        self.app.stress_mode_var.set("Adverse move (%)")
+        self.app.stress_pct_var.set("10")
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("PORTFOLIO VERDICT: ACCEPTED", report)
+        self.assertNotIn("ADVANCED MISSING:", report)
+        self.assertNotIn("ADVANCED BREACH:", report)
+        self.assertIn("Overnight debit reserve: 6", report)
+
+    def test_equity_import_and_saved_report_reopen_are_connected_to_ui(self) -> None:
+        self._enable_advanced_checks()
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "equity.csv"
+            csv_path.write_text(
+                "timestamp,balance,equity\n2026-10-19T00:00:00Z,10000,10000\n"
+                "2026-10-19T01:00:00Z,10000,9900\n", encoding="utf-8",
+            )
+            self.app.equity_report_path = str(Path(directory) / "equity_validation.json")
+            with patch.object(APP["filedialog"], "askopenfilename", return_value=str(csv_path)), \
+                    patch.object(APP["messagebox"], "askyesno", return_value=True), \
+                    patch.object(self.app, "_show_equity_report") as show:
+                self.app._import_equity_curve()
+                self.assertIn("NO SAMPLED BREACH", show.call_args.args[0])
+                self.app._open_saved_equity_report()
+                self.assertIn("OFFLINE SNAPSHOT", show.call_args.args[0])
+            self.assertTrue(Path(self.app.equity_report_path).exists())
+
+    def test_advanced_profile_and_per_robot_inputs_survive_actual_local_autosave(self) -> None:
+        self._enable_advanced_checks()
+        self.app.AUTOSAVE_ENABLED = True
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.assertTrue(self.app._save_autosave_scenario())
+            self.app.risk_profile = default_profile()
+            self.app.exposure_inputs.clear()
+            self.app._load_autosave_scenario()
+            row = next(iter(self.app.allocations))
+            self.assertTrue(self.app.risk_profile["enabled"])
+            self.assertEqual(self.app.exposure_inputs[row]["swap_long_debit"], "2")
+            self.assertEqual(self.app.exposure_inputs[row]["idea_group"], "US index")
+
+    def test_equity_report_atomic_replace_failure_preserves_previous_snapshot(self) -> None:
+        self._enable_advanced_checks()
+        samples = parse_equity_csv(
+            "timestamp,balance,equity\n2026-10-19T00:00:00Z,10000,10000\n"
+            "2026-10-19T01:00:00Z,10000,9900\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "equity_validation.json"
+            path.write_text("original snapshot", encoding="utf-8")
+            self.app.equity_report_path = str(path)
+            with patch.object(APP["os"], "replace", side_effect=OSError("locked")):
+                with self.assertRaisesRegex(OSError, "locked"):
+                    self.app._evaluate_and_save_equity_curve(samples)
+            self.assertEqual(path.read_text(encoding="utf-8"), "original snapshot")
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_mt5_preferences_store_only_executable_and_restore_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "terminal64.exe"
+            executable.touch()
+            self.app.mt5_config_path = str(Path(directory) / "mt5_connection.json")
+            self.app.mt5_terminal_path_var.set(str(executable))
+            self.app._save_mt5_config()
+            config = json.loads(Path(self.app.mt5_config_path).read_text(encoding="utf-8"))
+            self.assertEqual(config, {"terminal_path": str(executable)})
+            self.app.mt5_terminal_path_var.set("")
+            self.app._load_mt5_config()
+            self.assertEqual(self.app.mt5_terminal_path_var.get(), str(executable))
+
+    def test_failed_mt5_inspection_keeps_portfolio_and_stops_spinner(self) -> None:
+        before = self.app._scenario_data()
+        self.app._set_fetch_busy(True)
+        self.app.quote_messages.put((
+            "__mt5_status__", "mt5_status_done",
+            APP["MT5InspectionResult"]({}, "No terminal"),
+        ))
+        with patch.object(APP["messagebox"], "showerror") as error:
+            self.app._poll_quote_result()
+        error.assert_called_once()
+        self.assertFalse(self.app.quote_busy)
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_scenario_reload_cancels_mt5_inspection_result(self) -> None:
+        self.app._set_fetch_busy(True)
+        self.app._apply_scenario(validate_scenario(self.app._scenario_data()))
+        self.app.quote_messages.put((
+            "__mt5_status__", "mt5_status_done", APP["MT5InspectionResult"]({"server": "old"})
+        ))
+        with patch.object(self.app, "_show_data_status") as show:
+            self.app._poll_quote_result()
+        show.assert_not_called()
+        self.assertFalse(self.app.quote_busy)
+        self.assertEqual(self.app.mt5_connection, {})
+
+    def test_manual_broker_api_currency_mismatch_preserves_account_rooms_and_data(self) -> None:
+        before = self.app._scenario_data()
+        response = APP["MT5PortfolioResult"]({}, "EUR")
+        self.app.quote_messages.put(("__broker_api__", "broker_api_done", response))
+        with patch.object(APP["messagebox"], "showerror") as error:
+            self.app._poll_quote_result()
+        error.assert_called_once()
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_manual_mt5_currency_mismatch_leaves_all_account_and_market_data_unchanged(self) -> None:
+        before = self.app._scenario_data()
+        response = APP["MT5PortfolioResult"](
+            {self.row: APP["MT5SymbolData"](
+                dict(self.app.contract_inputs[self.row]),
+                self.app.history_bars[self.row], self.app.quotes[self.row],
+            )},
+            "EUR",
+        )
+        self.app._set_fetch_busy(True)
+        self.app.quote_messages.put(("__mt5__", "mt5_done", response))
+        with patch.object(APP["messagebox"], "showerror") as error, patch.object(
+            self.app, "_suggest_portfolio_downside"
+        ) as suggest:
+            self.app._poll_quote_result()
+        self.assertEqual(self.app._scenario_data(), before)
+        error.assert_called_once()
+        suggest.assert_not_called()
+        self.assertFalse(self.app.quote_busy)
+
+    def test_manual_mt5_reconnect_preserves_commission_and_ea_pip_conversion(self) -> None:
+        self.app.contract_inputs[self.row]["commission_per_lot"] = "7"
+        self.app.symbol_commission_per_lot_var.set("7")
+        incoming = dict(self.app.contract_inputs[self.row])
+        incoming.update(points_per_pip="", commission_per_lot="")
+        response = APP["MT5PortfolioResult"](
+            {self.row: APP["MT5SymbolData"](
+                incoming, self.app.history_bars[self.row], self.app.quotes[self.row]
+            )}, "USD",
+        )
+        self.app.quote_messages.put(("__mt5__", "mt5_done", response))
+        with patch.object(self.app, "_suggest_portfolio_downside"):
+            self.app._poll_quote_result()
+        self.assertEqual(self.app.contract_inputs[self.row]["commission_per_lot"], "7")
+        self.assertEqual(self.app.contract_inputs[self.row]["points_per_pip"], "1")
+
+    def test_changed_contract_does_not_reuse_manual_inputs_or_autogenerate(self) -> None:
+        self.app.contract_inputs[self.row]["commission_per_lot"] = "7"
+        self.app.symbol_commission_per_lot_var.set("7")
+        incoming = dict(self.app.contract_inputs[self.row])
+        incoming.update(point_size="0.01", points_per_pip="", commission_per_lot="")
+        response = APP["MT5PortfolioResult"](
+            {self.row: APP["MT5SymbolData"](
+                incoming, self.app.history_bars[self.row], self.app.quotes[self.row]
+            )}, "USD",
+        )
+        self.app.quote_messages.put(("__mt5__", "mt5_done", response))
+        with patch.object(APP["messagebox"], "showwarning") as warning, patch.object(
+            self.app, "_suggest_portfolio_downside"
+        ) as suggest:
+            self.app._poll_quote_result()
+        warning.assert_called_once()
+        suggest.assert_not_called()
+        self.assertEqual(self.app.contract_inputs[self.row]["commission_per_lot"], "")
+
+    def test_history_quality_checks_actual_dates_and_seven_day_freshness(self) -> None:
+        stress = self.app.historical_stresses[self.row]
+        now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        complete = replace(
+            stress, start_date="2021-10-20", end_date="2026-10-13", bar_count=1300
+        )
+        self.assertEqual(APP["history_quality_warnings"](complete, now), ())
+        incomplete = replace(
+            stress, start_date="2026-09-01", end_date="2026-10-12"
+        )
+        warnings = APP["history_quality_warnings"](incomplete, now)
+        self.assertEqual(len(warnings), 3)
+        self.assertIn("five-year", warnings[0])
+        self.assertIn("stale", warnings[1])
+
+    def test_history_quality_exact_sample_coverage_and_future_date_boundaries(self) -> None:
+        stress = replace(
+            self.app.historical_stresses[self.row],
+            start_date="2021-11-03", end_date="2026-10-20", bar_count=1000,
+        )
+        now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        quality = APP["history_quality_warnings"]
+        self.assertEqual(quality(stress, now), ())
+        self.assertIn("sparse", quality(replace(stress, bar_count=999), now)[0])
+        self.assertIn(
+            "five-year", quality(replace(stress, start_date="2021-11-04"), now)[0]
+        )
+        self.assertIn(
+            "future", quality(replace(stress, end_date="2026-10-21"), now)[0]
+        )
+
+    def test_data_status_and_report_include_actual_coverage_and_warnings(self) -> None:
+        status = self.app._data_status_text()
+        self.assertIn(self.app.history_sources[self.row], status)
+        self.assertIn("20 daily bars", status)
+        self.assertIn("less than", status)
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("Actual history:", report)
+        self.assertIn("HISTORY WARNING:", report)
+
+    def test_short_stale_history_cannot_receive_accepted_verdict_even_with_loss_room(self) -> None:
+        self.app.prop_total_loss_room_var.set("2000")
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("PORTFOLIO VERDICT: UNVERIFIED", report)
+        self.assertNotIn("PORTFOLIO VERDICT: ACCEPTED", report)
+        with self.assertRaisesRegex(ValueError, "UNVERIFIED"):
+            self.app._generate_settings_checked(
+                show_errors=False, require_complete_portfolio=True,
+            )
+
+    def _open_prop_preview(self) -> None:
+        self.app.prop_website_snapshot = PropWebsiteTests.snapshot()
+        self.app._open_prop_website_import()
+        self.app.prop_preview_tree.selection_set("0")
+        self.app._select_prop_rule()
+
+    def test_website_import_only_changes_limits_after_review_and_confirmation(self) -> None:
+        before = self.app._scenario_data()
+        self._open_prop_preview()
+        with patch.object(APP["messagebox"], "showerror") as error:
+            self.app._apply_prop_website_rules()
+        error.assert_called_once()
+        self.assertEqual(before, self.app._scenario_data())
+        self.app.prop_reviewed_var.set(True)
+        self.app.prop_new_account_var.set(True)
+        self.app.account_capital_var.set("25000")
+        with patch.object(APP["messagebox"], "askyesno", return_value=True), patch.object(
+            self.app, "_suggest_portfolio_downside"
+        ) as suggest:
+            self.app._apply_prop_website_rules(suggest=True)
+        self.assertEqual(self.app.daily_limit_var.get(), "5.5")
+        self.assertEqual(Decimal(self.app.prop_total_loss_room_var.get()), Decimal("2750"))
+        self.assertEqual(Decimal(self.app.remaining_daily_loss_room_var.get()), Decimal("1375"))
+        self.assertEqual(self.app.limit_mode_var.get(), "Percent of account")
+        suggest.assert_called_once()
+        validate_scenario(self.app._scenario_data())
+
+    def test_existing_account_requires_actual_rooms_before_applying(self) -> None:
+        self._open_prop_preview()
+        self.app.prop_reviewed_var.set(True)
+        self.app.prop_total_loss_room_var.set("")
+        with patch.object(APP["messagebox"], "showerror") as error, patch.object(
+            APP["messagebox"], "askyesno"
+        ) as confirm:
+            self.app._apply_prop_website_rules()
+        error.assert_called_once()
+        confirm.assert_not_called()
+
+    def test_existing_account_rooms_are_not_replaced_with_nominal_limits(self) -> None:
+        self._open_prop_preview()
+        self.app.prop_reviewed_var.set(True)
+        self.app.remaining_daily_loss_room_var.set("200")
+        self.app.prop_total_loss_room_var.set("500")
+        with patch.object(APP["messagebox"], "askyesno", return_value=True):
+            self.app._apply_prop_website_rules()
+        self.assertEqual(self.app.remaining_daily_loss_room_var.get(), "200")
+        self.assertEqual(self.app.prop_total_loss_room_var.get(), "500")
+
+    def test_declining_prop_rules_preserves_account(self) -> None:
+        self._open_prop_preview()
+        self.app.prop_reviewed_var.set(True)
+        self.app.prop_new_account_var.set(True)
+        before = self.app._scenario_data()
+        with patch.object(APP["messagebox"], "askyesno", return_value=False):
+            self.app._apply_prop_website_rules()
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_extracted_snapshot_is_saved_and_reloaded_offline_without_applying(self) -> None:
+        before = self.app._scenario_data()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            self.app._poll_quote_result.__globals__, APP_DATA_DIRECTORY=directory
+        ):
+            self.app._set_fetch_busy(True)
+            self.app.quote_messages.put(
+                ("__prop__", "prop_website_done", PropWebsiteTests.snapshot())
+            )
+            self.app._poll_quote_result()
+            path = Path(directory) / "prop_website.json"
+            self.assertTrue(path.is_file())
+            self.app.prop_website_snapshot = None
+            self.app._open_prop_website_import()
+            self.assertEqual(len(self.app.prop_preview_tree.get_children()), 2)
+            self.assertFalse(self.app.prop_reviewed_var.get())
+        self.assertFalse(self.app.quote_busy)
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_website_failure_stops_indicator_without_changing_account(self) -> None:
+        before = self.app._scenario_data()
+        self.app._set_fetch_busy(True)
+        self.app.quote_messages.put(("__prop__", "prop_website_done", "HTTP 403"))
+        with patch.object(APP["messagebox"], "showerror") as error:
+            self.app._poll_quote_result()
+        error.assert_called_once()
+        self.assertFalse(self.app.quote_busy)
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_late_website_response_is_cancelled_after_scenario_reload(self) -> None:
+        scenario = self.app._scenario_data()
+        self.app._set_fetch_busy(True)
+        self.app._apply_scenario(validate_scenario(scenario))
+        self.app.quote_messages.put(
+            ("__prop__", "prop_website_done", PropWebsiteTests.snapshot())
+        )
+        with patch.object(self.app, "_display_prop_website_snapshot") as display:
+            self.app._poll_quote_result()
+        display.assert_not_called()
+        self.assertIsNone(self.app.prop_website_snapshot)
+        self.assertFalse(self.app.quote_busy)
+
+    def test_spiceprop_reference_is_available_offline_without_changing_account(self) -> None:
+        before = self.app._scenario_data()
+        rows = [
+            self.app.spiceprop_reference_tree.item(row, "values")
+            for row in self.app.spiceprop_reference_tree.get_children()
+        ]
+        self.assertEqual(rows, [
+            ("25000 EUR", "Phase 1", "5.5% / 1375.0 EUR",
+             "11% / 2750 EUR", "7.5% / 1875.0 EUR"),
+            ("25000 EUR", "Phase 2", "4.5% / 1125.0 EUR",
+             "11% / 2750 EUR", "5% / 1250 EUR"),
+            ("25000 EUR", "Funded", "4.5% / 1125.0 EUR",
+             "11% / 2750 EUR", "No evaluation target"),
+        ])
+        reference = APP["SPICEPROP_SWEET_REFERENCE"]
+        self.assertNotIn(1000, reference["account_sizes"])
+        self.assertIn(25000, reference["account_sizes"])
+        self.assertEqual(reference["verified_on"], "2026-10-20")
+        self.assertEqual(reference["funded_idea_risk_percent"], "2")
+        self.assertEqual(
+            reference["source"], "https://spiceprop.com/programs/sweet"
+        )
+        self.assertEqual(self.app._scenario_data(), before)
+
+    def test_prop_account_fields_are_in_a_separate_tab(self) -> None:
+        self.assertEqual(
+            [self.app.notebook.tab(tab, "text") for tab in self.app.notebook.tabs()],
+            ["Prop firm & account", "Portfolio", "Robot settings"],
+        )
+        variables = {
+            str(variable)
+            for variable in (
+                self.app.account_capital_var,
+                self.app.currency_var,
+                self.app.daily_limit_var,
+                self.app.limit_mode_var,
+                self.app.remaining_daily_loss_room_var,
+                self.app.prop_total_loss_room_var,
+            )
+        }
+
+        def field_variables(widget):
+            found = set()
+            for child in widget.winfo_children():
+                if "textvariable" in child.keys():
+                    found.add(str(child.cget("textvariable")))
+                found.update(field_variables(child))
+            return found
+
+        self.assertTrue(
+            variables.issubset(field_variables(self.app.prop_account_tab))
+        )
+        self.assertTrue(variables.isdisjoint(field_variables(self.app.portfolio_tab)))
+        self.app.notebook.select(self.app.prop_account_tab)
+        self.app._main_tab_changed()
+        self.assertEqual(
+            self.app.notebook.select(), str(self.app.prop_account_tab)
+        )
+
+    def test_prop_account_changes_autosave_and_restore_on_next_launch(self) -> None:
+        self.app.AUTOSAVE_ENABLED = True
+        self.app._install_autosave_traces()
+        expected = {
+            "account_capital": "25000",
+            "currency": "EUR",
+            "daily_limit": "750",
+            "limit_mode": "Cash amount",
+            "remaining_daily_loss_room": "600",
+            "prop_total_loss_room": "2000",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            for variable, value in (
+                (self.app.account_capital_var, expected["account_capital"]),
+                (self.app.currency_var, expected["currency"]),
+                (self.app.daily_limit_var, expected["daily_limit"]),
+                (self.app.limit_mode_var, expected["limit_mode"]),
+                (
+                    self.app.remaining_daily_loss_room_var,
+                    expected["remaining_daily_loss_room"],
+                ),
+                (self.app.prop_total_loss_room_var, expected["prop_total_loss_room"]),
+            ):
+                variable.set(value)
+            self.assertTrue(self.app._autosave_dirty)
+            self.app.after(850, self.app.quit)
+            self.app.mainloop()
+            saved = json.loads(
+                Path(self.app.autosave_path).read_text(encoding="utf-8")
+            )
+            for field, value in expected.items():
+                self.assertEqual(saved["portfolio"][field], value)
+
+            app_class = APP["RiskCalculatorApp"]
+            with patch.dict(
+                app_class.__init__.__globals__, APP_DATA_DIRECTORY=directory
+            ), patch.object(app_class, "AUTOSAVE_ENABLED", True):
+                restored = app_class()
+            try:
+                portfolio = restored._scenario_data()["portfolio"]
+                for field, value in expected.items():
+                    self.assertEqual(portfolio[field], value)
+                self.assertEqual(
+                    restored.notebook.select(), str(restored.prop_account_tab)
+                )
+            finally:
+                restored._close_app()
+
     def test_constructor_schedules_refresh_after_building_ui(self) -> None:
         app_class = APP["RiskCalculatorApp"]
         with patch.object(app_class, "STARTUP_REFRESH_ENABLED", True), patch.object(
@@ -1569,6 +2291,7 @@ class CandidateGenerationTests(unittest.TestCase):
 
     def test_startup_terminal_refresh_preserves_manual_commission_and_pip_conversion(self) -> None:
         self.app.contract_inputs[self.row]["commission_per_lot"] = "7"
+        self.app.symbol_commission_per_lot_var.set("7")
         contract = dict(self.app.contract_inputs[self.row])
         contract.update(points_per_pip="", commission_per_lot="")
         response = APP["MT5PortfolioResult"](
@@ -2076,6 +2799,19 @@ class CandidateGenerationTests(unittest.TestCase):
         scenario["allocations"].append(second_allocation)
         self.app._apply_scenario(validate_scenario(scenario))
         self.app.prop_total_loss_room_var.set("2000")
+        today = datetime.now(timezone.utc).date()
+        bars = tuple(
+            DailyBar(
+                date=(today - timedelta(days=offset)).isoformat(),
+                open=Decimal("100"), high=Decimal("105"), low=Decimal("90"),
+                close=Decimal("100"),
+            )
+            for offset in range(1825, -1, -1)
+            if (today - timedelta(days=offset)).weekday() < 5
+        )
+        for row_id in self.app.allocations:
+            self.app.history_bars[row_id] = bars
+            self.app.historical_stresses[row_id] = calculate_historical_stress(bars)
 
         self.app._generate_settings_checked(
             show_errors=False,

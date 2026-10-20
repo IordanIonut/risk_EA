@@ -9,17 +9,25 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import importlib
 import io
 import json
+from html.parser import HTMLParser
 import os
 import queue
 import re
 from string import Formatter
 import tempfile
 import threading
+from typing import TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlsplit
 from urllib.request import Request, urlopen
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+from advanced_risk import (
+    EquitySample, ExposureInputs, ModeledExposure, check_exposures,
+    default_exposure, default_profile, evaluate_equity_curve, parse_equity_csv,
+    remaining_rooms, validate_exposure, validate_profile,
+)
 
 from risk_calculator import (
     Allocation,
@@ -192,6 +200,168 @@ HISTORICAL_STRESS_MODES = (
 MT5_HISTORY_SOURCES = ("MT5 CSV", "MT5 terminal")
 BROKER_HISTORY_SOURCES = (*MT5_HISTORY_SOURCES, "Broker API")
 LEGACY_HISTORICAL_STRESS_MODE = "Yahoo 5-year max daily range"
+PROP_WEBSITE_FILE_NAME = "prop_website.json"
+
+
+class PropRuleCandidate(TypedDict):
+    stage: str
+    daily_percent: str
+    total_percent: str
+    evidence: str
+
+
+class PropWebsiteSnapshot(TypedDict):
+    source: str
+    fetched_at: str
+    candidates: list[PropRuleCandidate]
+
+
+class PropWebsiteParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self.row: list[str] = []
+        self.cell: list[str] | None = None
+        self.hidden_depth = 0
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag in ("script", "style"):
+            self.hidden_depth += 1
+        if self.hidden_depth:
+            return
+        if tag == "table":
+            self.rows.append([])
+        elif tag == "tr":
+            self.row = []
+        elif tag in ("td", "th"):
+            self.cell = []
+        elif self.cell is not None:
+            self.cell.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_depth and self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self.hidden_depth:
+            self.hidden_depth -= 1
+        if self.hidden_depth:
+            return
+        if tag in ("td", "th") and self.cell is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row:
+            self.rows.append(self.row)
+            self.row = []
+
+
+def extract_prop_website_rules(html: str) -> list[PropRuleCandidate]:
+    parser = PropWebsiteParser()
+    parser.feed(html)
+    headers: list[str] = []
+    candidates: list[PropRuleCandidate] = []
+    number = r"(\d+(?:[.,]\d+)?)\s*%"
+
+    def percent(text: str) -> str:
+        matches = re.findall(number, text)
+        return matches[0].replace(",", ".") if len(matches) == 1 else ""
+
+    for row in parser.rows:
+        if not row:
+            headers = []
+            continue
+        lower = [cell.lower() for cell in row]
+        if any("daily" in cell for cell in lower) and not any(
+            re.search(number, cell) for cell in row
+        ):
+            headers = lower
+            continue
+        daily_values: set[str] = set()
+        total_values: set[str] = set()
+        for index, cell in enumerate(row):
+            header = headers[index] if index < len(headers) else ""
+            if "daily" in header and "total" not in header:
+                daily_values.add(percent(cell))
+            if any(word in header for word in ("total", "overall", "maximum loss")) and "daily" not in header:
+                total_values.add(percent(cell))
+            daily_values.update(
+                match.replace(",", ".")
+                for match in re.findall(number + r"\s*(?:daily|per day)\b", cell, re.I)
+            )
+            total_values.update(
+                match.replace(",", ".")
+                for match in re.findall(number + r"\s*(?:total|overall)\b", cell, re.I)
+            )
+        if len(daily_values) != 1 or len(total_values) != 1:
+            continue
+        daily = next(iter(daily_values))
+        total = next(iter(total_values))
+        if daily and total and ZERO < Decimal(daily) <= Decimal(total) < ONE_HUNDRED:
+            candidates.append({
+                "stage": row[0][:200],
+                "daily_percent": daily,
+                "total_percent": total,
+                "evidence": " | ".join(row)[:2000],
+            })
+    return candidates[:100]
+
+
+def fetch_prop_website(url: str) -> PropWebsiteSnapshot:
+    parsed = urlsplit(url.strip())
+    if (
+        parsed.scheme != "https" or not parsed.hostname
+        or parsed.username or parsed.password or parsed.fragment
+    ):
+        raise ValueError("Use a public HTTPS program URL without credentials or fragments.")
+    request = Request(
+        url.strip(), headers={"User-Agent": "MT5RiskPlanner/1.0", "Accept": "text/html"}
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            if urlsplit(response.geturl()).scheme != "https":
+                raise ValueError("The program website redirected to a non-HTTPS URL.")
+            body = response.read(2 * 1024 * 1024 + 1)
+            charset = response.headers.get_content_charset() or "utf-8"
+            final_url = response.geturl()
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError("Program page exceeds the 2 MiB download limit.")
+        html = body.decode(charset)
+    except HTTPError as error:
+        raise ValueError(f"Program website returned HTTP {error.code}.") from error
+    except (URLError, OSError, UnicodeError, LookupError) as error:
+        raise ValueError(f"Could not read the program website: {error}") from error
+    candidates = extract_prop_website_rules(html)
+    if not candidates:
+        raise ValueError(
+            "No unambiguous daily/total percentage pairs were found in HTML tables. "
+            "JavaScript-only pages, PDFs, vertical tables and other languages may "
+            "require manual entry. Existing account values were not changed."
+        )
+    return {
+        "source": final_url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "candidates": candidates,
+    }
+
+
+SPICEPROP_SWEET_REFERENCE = {
+    "program": "SpiceProp Sweet / Spice 2 Step",
+    "verified_on": "2026-10-20",
+    "source": "https://spiceprop.com/programs/sweet",
+    "rules_source": (
+        "https://spiceprop.com/qa/902-what-are-the-main-account-objectives-and-rules"
+    ),
+    "currency": "EUR",
+    "account_sizes": (6000, 10000, 25000, 50000, 100000, 150000),
+    "phases": (
+        ("Phase 1", "5.5", "11", "7.5"),
+        ("Phase 2", "4.5", "11", "5"),
+        ("Funded", "4.5", "11", None),
+    ),
+    "funded_idea_risk_percent": "2",
+}
 
 
 def historical_stress_move(
@@ -258,17 +428,69 @@ class MT5PortfolioResult:
     error: str | None = None
 
 
-def fetch_mt5_terminal_data(
-    symbols: list[str],
-    history_years: int = 5,
-    mt5_module: object | None = None,
-) -> tuple[str, dict[str, MT5SymbolData]]:
-    if (
-        isinstance(history_years, bool)
-        or not isinstance(history_years, int)
-        or history_years <= 0
-    ):
-        raise ValueError("MT5 history years must be a positive integer.")
+@dataclass(frozen=True)
+class MT5InspectionResult:
+    connection: dict[str, str]
+    error: str = ""
+
+
+def history_quality_warnings(
+    stress: HistoricalStress, now: datetime | None = None
+) -> tuple[str, ...]:
+    today = (now or datetime.now(timezone.utc)).date()
+    try:
+        expected_start = today.replace(year=today.year - 5)
+    except ValueError:
+        expected_start = today.replace(year=today.year - 5, day=28)
+    first = datetime.strptime(stress.start_date, "%Y-%m-%d").date()
+    last = datetime.strptime(stress.end_date, "%Y-%m-%d").date()
+    warnings = []
+    if first > expected_start + timedelta(days=14):
+        warnings.append("History covers less than the requested five-year window.")
+    if last < today - timedelta(days=7):
+        warnings.append("History is stale: last daily bar is more than 7 days old.")
+    if last > today:
+        warnings.append("History contains future-dated bars.")
+    if stress.bar_count < 1000:
+        warnings.append("Fewer than 1000 daily bars: five-year sample is too sparse.")
+    return tuple(warnings)
+
+
+def merge_refreshed_contract(
+    previous: ContractFields, incoming: ContractFields
+) -> tuple[ContractFields, bool]:
+    merged = dict(incoming)
+    fields = (
+        "contract_currency", "point_size", "point_value", "lot_increment",
+        "minimum_lot", "maximum_lot",
+    )
+    matching = True
+    for field in fields:
+        old = previous.get(field, "").strip()
+        new = incoming.get(field, "").strip()
+        if field == "contract_currency":
+            equal = old.upper() == new.upper()
+        elif old and new:
+            try:
+                equal = decimal_value(old, field) == decimal_value(new, field)
+            except ValueError:
+                equal = False
+        else:
+            equal = old == new
+        matching = matching and equal
+    review_required = False
+    for field in ("points_per_pip", "commission_per_lot"):
+        if not incoming.get(field) and previous.get(field):
+            if matching:
+                merged[field] = previous[field]
+            else:
+                review_required = True
+    return merged, review_required
+
+
+def connect_mt5(
+    mt5_module: object | None = None, terminal_path: str = ""
+) -> tuple[object, bool]:
     if mt5_module is None:
         try:
             mt5_module = importlib.import_module("MetaTrader5")
@@ -281,10 +503,119 @@ def fetch_mt5_terminal_data(
 
     mt5 = mt5_module
     terminal_was_initialized = getattr(mt5, "terminal_info")() is not None
-    if not terminal_was_initialized and not getattr(mt5, "initialize")():
+    if terminal_path:
+        initialized = getattr(mt5, "initialize")(terminal_path)
+    else:
+        initialized = terminal_was_initialized or getattr(mt5, "initialize")()
+    if not initialized:
         raise ValueError(
             f"Could not connect to the MT5 terminal: {getattr(mt5, 'last_error')()}."
         )
+    return mt5, bool(terminal_path) or not terminal_was_initialized
+
+
+def inspect_mt5_terminal(
+    terminal_path: str = "", mt5_module: object | None = None,
+    requested_symbols: tuple[str, ...] = (),
+) -> dict[str, str]:
+    mt5, owns_connection = connect_mt5(mt5_module, terminal_path)
+    try:
+        terminal = getattr(mt5, "terminal_info")()
+        account = getattr(mt5, "account_info")()
+        if terminal is None or account is None:
+            raise ValueError("MT5 terminal/account information is unavailable. Log in first.")
+        symbols = getattr(mt5, "symbols_get")()
+        if symbols is None:
+            raise ValueError(f"MT5 symbol list unavailable: {getattr(mt5, 'last_error')()}.")
+        mode = getattr(account, "trade_mode", None)
+        modes = {
+            getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0): "DEMO",
+            getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", 1): "CONTEST",
+            getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", 2): "REAL",
+        }
+        risk_details = []
+        for symbol in dict.fromkeys(requested_symbols):
+            if not getattr(mt5, "symbol_select")(symbol, True):
+                risk_details.append(
+                    f"WARNING: MT5 could not select {symbol}; choose an exact symbol "
+                    "from the returned broker list before fetching specs/margin."
+                )
+                continue
+            info = getattr(mt5, "symbol_info")(symbol)
+            tick = getattr(mt5, "symbol_info_tick")(symbol)
+            if info is None or tick is None:
+                risk_details.append(f"WARNING: MT5 has no live contract/tick for {symbol}.")
+                continue
+            volume = Decimal(str(getattr(info, "volume_min", 0)))
+            ask = Decimal(str(getattr(tick, "ask", 0)))
+            bid = Decimal(str(getattr(tick, "bid", 0)))
+            if any(not value.is_finite() or value <= ZERO for value in (volume, ask, bid)):
+                risk_details.append(f"WARNING: invalid MT5 live quote/minimum volume for {symbol}.")
+                continue
+            margins = []
+            for side, price in (("BUY", ask), ("SELL", bid)):
+                margin = getattr(mt5, "order_calc_margin")(
+                    getattr(mt5, f"ORDER_TYPE_{side}"), symbol, float(volume), float(price)
+                )
+                if margin is None:
+                    margins.append(
+                        f"WARNING: {side} margin unavailable: {getattr(mt5, 'last_error')()}"
+                    )
+                    continue
+                value = Decimal(str(margin))
+                if not value.is_finite() or value < ZERO:
+                    margins.append(f"WARNING: invalid {side} margin returned by MT5")
+                    continue
+                margins.append(f"{side} margin/lot estimate={value / volume}")
+            risk_details.append(
+                f"{symbol}: " + "; ".join(margins)
+                + f"; raw swap_long={getattr(info, 'swap_long', 'unavailable')}"
+                + f"; raw swap_short={getattr(info, 'swap_short', 'unavailable')}"
+                + f"; swap_mode={getattr(info, 'swap_mode', 'unavailable')}"
+                + f"; triple-day enum={getattr(info, 'swap_rollover3days', 'unavailable')}"
+                + f"; point={getattr(info, 'point', 'unavailable')}. "
+                "Margin estimates use current prices and minimum volume, in account cash; "
+                "verify worst-price/volume tiers before copying a conservative per-lot bound. "
+                "Raw swaps are NOT normalized cash: verify swap mode, currency, points "
+                "and charge-day weights before entering debit/lot/charge-day."
+            )
+        return {
+            "terminal_path": str(getattr(terminal, "path", "")),
+            "connected": str(getattr(terminal, "connected", False)),
+            "broker": str(getattr(account, "company", "")),
+            "server": str(getattr(account, "server", "")),
+            "account_type": modes.get(mode, "UNKNOWN"),
+            "currency": str(getattr(account, "currency", "")),
+            "leverage": str(getattr(account, "leverage", "")),
+            "free_margin": str(getattr(account, "margin_free", "")),
+            "equity": str(getattr(account, "equity", "")),
+            "used_margin": str(getattr(account, "margin", "")),
+            "stopout_mode": str(getattr(account, "margin_so_mode", "")),
+            "stopout_level": str(getattr(account, "margin_so_so", "")),
+            "risk_details": "\n".join(risk_details),
+            "symbols": "\n".join(sorted(
+                str(getattr(symbol, "name", "")) for symbol in symbols
+                if getattr(symbol, "name", "")
+            )),
+        }
+    finally:
+        if owns_connection:
+            getattr(mt5, "shutdown")()
+
+
+def fetch_mt5_terminal_data(
+    symbols: list[str],
+    history_years: int = 5,
+    mt5_module: object | None = None,
+    terminal_path: str = "",
+) -> tuple[str, dict[str, MT5SymbolData]]:
+    if (
+        isinstance(history_years, bool)
+        or not isinstance(history_years, int)
+        or history_years <= 0
+    ):
+        raise ValueError("MT5 history years must be a positive integer.")
+    mt5, owns_connection = connect_mt5(mt5_module, terminal_path)
 
     try:
         account = getattr(mt5, "account_info")()
@@ -416,7 +747,7 @@ def fetch_mt5_terminal_data(
             raise ValueError("No MT5 broker symbols were selected for data fetch.")
         return account_currency, result
     finally:
-        if not terminal_was_initialized:
+        if owns_connection:
             getattr(mt5, "shutdown")()
 
 
@@ -1247,6 +1578,8 @@ class RiskCalculatorApp(tk.Tk):
         self.next_allocation_id = 1
         self.allocation_results: dict[str, AllocationResult] = {}
         self.contract_inputs: dict[str, ContractFields] = {}
+        self.risk_profile = default_profile()
+        self.exposure_inputs: dict[str, ExposureInputs] = {}
         self.quotes: dict[str, QuoteData] = {}
         self.historical_stresses: dict[str, HistoricalStress] = {}
         self.history_bars: dict[str, tuple[DailyBar, ...]] = {}
@@ -1258,6 +1591,7 @@ class RiskCalculatorApp(tk.Tk):
         self._startup_refresh_after_id: str | None = None
         self.fetch_all_button: ttk.Button | None = None
         self.fetch_mt5_button: ttk.Button | None = None
+        self.inspect_mt5_button: ttk.Button | None = None
         self.fetch_broker_api_button: ttk.Button | None = None
         self.batch_total = 0
         self.batch_completed = 0
@@ -1277,14 +1611,21 @@ class RiskCalculatorApp(tk.Tk):
         )
         self.broker_api_endpoint_var = tk.StringVar()
         self.broker_api_token_var = tk.StringVar()
+        self.mt5_terminal_path_var = tk.StringVar()
+        self.mt5_connection: dict[str, str] = {}
+        self.mt5_config_path = os.path.join(APP_DATA_DIRECTORY, "mt5_connection.json")
+        self.equity_report_path = os.path.join(APP_DATA_DIRECTORY, "equity_validation.json")
         self._autosave_loading = False
         self._autosave_dirty = False
         self._autosave_after_id: str | None = None
         self._autosave_trace_variables: set[str] = set()
         self.cached_data_warnings: dict[str, str] = {}
+        self.prop_website_snapshot: PropWebsiteSnapshot | None = None
+        self.prop_import_window: tk.Toplevel | None = None
 
         self._build_ui()
         self._load_broker_api_config()
+        self._load_mt5_config()
         self._add_default_allocation()
         self._refresh_allocation_choices()
         if self.AUTOSAVE_ENABLED:
@@ -1328,10 +1669,13 @@ class RiskCalculatorApp(tk.Tk):
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=10)
+        self.prop_account_tab = ttk.Frame(self.notebook, padding=12)
         self.portfolio_tab = ttk.Frame(self.notebook, padding=12)
         self.settings_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(self.prop_account_tab, text="Prop firm & account")
         self.notebook.add(self.portfolio_tab, text="Portfolio")
         self.notebook.add(self.settings_tab, text="Robot settings")
+        self._build_prop_account_tab()
         self._build_portfolio_tab()
         self._build_settings_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._main_tab_changed)
@@ -1459,6 +1803,7 @@ class RiskCalculatorApp(tk.Tk):
                         self.historical_stresses.get(row_id)
                     ),
                     "history_source": self.history_sources.get(row_id, ""),
+                    "exposure_inputs": dict(self.exposure_inputs.get(row_id, default_exposure())),
                     "history_bars": [
                         {
                             "date": bar.date,
@@ -1485,7 +1830,8 @@ class RiskCalculatorApp(tk.Tk):
         selected_index = row_ids.index(selected_id) if selected_id in row_ids else None
         return {
             "format": "mt5-risk-planner-scenario",
-            "version": 13,
+            "version": 14,
+            "risk_profile": dict(self.risk_profile),
             "portfolio": {
                 "account_capital": self.account_capital_var.get(),
                 "currency": self.currency_var.get(),
@@ -1526,9 +1872,12 @@ class RiskCalculatorApp(tk.Tk):
             data.get("format") != "mt5-risk-planner-scenario"
             or isinstance(version, bool)
             or not isinstance(version, int)
-            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
         ):
             raise ValueError("Unsupported or unrecognized scenario file format.")
+        risk_profile = validate_profile(
+            data.get("risk_profile") if version >= 14 else default_profile()
+        )
 
         def required_mapping(parent: dict[str, object], key: str) -> dict[str, object]:
             value = parent.get(key)
@@ -2051,6 +2400,9 @@ class RiskCalculatorApp(tk.Tk):
                     "quote": normalized_quote,
                     "historical_stress": historical_stress,
                     "history_source": history_source,
+                    "exposure_inputs": validate_exposure(
+                        raw.get("exposure_inputs") if version >= 14 else default_exposure()
+                    ),
                     "history_bars": history_bars,
                 }
             )
@@ -2172,6 +2524,7 @@ class RiskCalculatorApp(tk.Tk):
 
         return {
             "portfolio": portfolio,
+            "risk_profile": risk_profile,
             "new_allocation": new_allocation,
             "allocations": normalized_allocations,
             "settings": {"text": clean_text, "options": clean_options},
@@ -2442,6 +2795,7 @@ class RiskCalculatorApp(tk.Tk):
         assert isinstance(new_allocation, dict)
         assert isinstance(settings, dict)
         assert isinstance(raw_allocations, list)
+        self.risk_profile = validate_profile(scenario.get("risk_profile", default_profile()))
 
         self.account_capital_var.set(portfolio["account_capital"])
         self.currency_var.set(portfolio["currency"])
@@ -2485,6 +2839,7 @@ class RiskCalculatorApp(tk.Tk):
         self.history_sources.clear()
         self.magic_assignments.clear()
         self.contract_inputs.clear()
+        self.exposure_inputs.clear()
         self.saved_quote_rows.clear()
         self.saved_history_rows.clear()
         self.current_settings_row = None
@@ -2502,6 +2857,9 @@ class RiskCalculatorApp(tk.Tk):
                 item.get("allocation_percent") or None,
             )
             row_id = list(self.allocations)[-1]
+            self.exposure_inputs[row_id] = validate_exposure(
+                item.get("exposure_inputs", default_exposure())
+            )
             contracts_to_restore[row_id] = item["broker_contract"]
             history_data = item["historical_stress"]
             if history_data is not None:
@@ -2612,10 +2970,15 @@ class RiskCalculatorApp(tk.Tk):
         self._update_robot_options()
         self.output_text.delete("1.0", "end")
 
-    def _build_portfolio_tab(self) -> None:
+    def _build_prop_account_tab(self) -> None:
+        ttk.Button(
+            self.prop_account_tab,
+            text="Import prop rules from website...",
+            command=self._open_prop_website_import,
+        ).pack(anchor="w", pady=(0, 10))
         account = ttk.LabelFrame(
-            self.portfolio_tab,
-            text="Account and daily drawdown limit",
+            self.prop_account_tab,
+            text="Prop account and loss limits",
             style="Section.TLabelframe",
             padding=10,
         )
@@ -2653,13 +3016,6 @@ class RiskCalculatorApp(tk.Tk):
         ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
         ttk.Label(
             account,
-            text=(
-                "Enter each robot as a percentage of account capital; percentages "
-                "may total up to 100% and are converted to cash allocations."
-            ),
-        ).grid(row=1, column=7, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(
-            account,
             text="Remaining prop overall-loss room (cash; optional)",
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=(0, 5), pady=(5, 0))
         ttk.Entry(
@@ -2689,6 +3045,574 @@ class RiskCalculatorApp(tk.Tk):
             wraplength=1050,
         ).grid(row=5, column=0, columnspan=7, sticky="w", pady=(3, 0))
 
+        ttk.Label(
+            self.prop_account_tab,
+            text=(
+                "These account values and prop loss limits are saved automatically "
+                "with your portfolio and restored when the application opens. "
+                "Enter the limits from your firm's rules; no firm-specific rules "
+                "are inferred automatically."
+            ),
+            wraplength=1050,
+        ).pack(fill="x", pady=(4, 8))
+        ttk.Label(
+            self.prop_account_tab,
+            text=f"Local JSON: {self.autosave_path}",
+            wraplength=1050,
+        ).pack(fill="x")
+        ttk.Button(
+            self.prop_account_tab,
+            text="Configure robots in Portfolio",
+            command=lambda: self.notebook.select(self.portfolio_tab),
+        ).pack(anchor="w", pady=(12, 0))
+        advanced_actions = ttk.Frame(self.prop_account_tab)
+        advanced_actions.pack(fill="x", pady=6)
+        ttk.Button(
+            advanced_actions, text="Advanced prop, margin & swap...",
+            command=self._open_advanced_risk,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            advanced_actions, text="Evaluate MT5 equity CSV...",
+            command=self._import_equity_curve,
+        ).pack(side="left")
+        ttk.Button(
+            advanced_actions, text="Open saved equity report",
+            command=self._open_saved_equity_report,
+        ).pack(side="left", padx=8)
+        self._build_spiceprop_reference()
+
+    def _open_advanced_risk(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Explicit prop rules, margin and overnight costs")
+        window.geometry("1000x760")
+        window.transient(self)
+        window.grab_set()
+        enabled = tk.BooleanVar(value=self.risk_profile["enabled"])
+        ttk.Checkbutton(
+            window, text="Enable advanced constraints for candidate sizing and verdict",
+            variable=enabled,
+        ).pack(anchor="w", padx=12, pady=8)
+        ttk.Label(
+            window, wraplength=960,
+            text=(
+                "All cash values use the configured account currency. Enter verified rules; "
+                "website imports do not infer these. Trailing equity is continuous, uncapped, "
+                "with a fixed cash distance based on initial capital. Reset uses a FIXED UTC "
+                "offset (no automatic DST). Zero swap must be explicitly verified. "
+                "Margin per lot must be a conservative upper bound, not an inferred leverage."
+            ),
+        ).pack(fill="x", padx=12)
+        tabs = ttk.Notebook(window)
+        tabs.pack(fill="both", expand=True, padx=12, pady=8)
+        rules = ttk.Frame(tabs, padding=8)
+        exposures = ttk.Frame(tabs, padding=8)
+        tabs.add(rules, text="Account rules")
+        tabs.add(exposures, text="Per-robot exposure")
+        labels = {
+            "current_equity": "Current equity (cash)",
+            "daily_start_equity": "Equity at today's reset",
+            "daily_start_balance": "Balance at today's reset",
+            "daily_session_date": "Reset session start date YYYY-MM-DD (refresh daily)",
+            "daily_baseline": "Daily equity floor baseline",
+            "overall_rule": "Overall drawdown rule",
+            "total_limit_pct": "Overall loss % of initial capital",
+            "high_water_equity": "High-water equity (trailing; at curve start for CSV)",
+            "reset_time": "Daily reset HH:MM",
+            "utc_offset_minutes": "Reset fixed UTC offset (minutes; e.g. 120)",
+            "idea_limit_pct": "Max loss % per correlated idea",
+            "free_margin": "Current free margin (cash)",
+            "existing_margin": "Current used margin (cash)",
+            "stopout_pct": "Broker stop-out margin level % (not cash mode)",
+            "holding_days": "Swap charge-days (include triple-day/weekend weights)",
+        }
+        variables = {}
+        for position, (field, label) in enumerate(labels.items()):
+            variable = tk.StringVar(value=self.risk_profile[field])
+            variables[field] = variable
+            ttk.Label(rules, text=label).grid(row=position, column=0, sticky="w", pady=3)
+            choices = (
+                ("Equity", "Balance", "Higher of balance/equity")
+                if field == "daily_baseline" else
+                ("Static", "Trailing equity") if field == "overall_rule" else ()
+            )
+            widget = (
+                ttk.Combobox(rules, textvariable=variable, values=choices, state="readonly")
+                if choices else ttk.Entry(rules, textvariable=variable)
+            )
+            widget.grid(row=position, column=1, sticky="ew", padx=10)
+        rules.columnconfigure(1, weight=1)
+        ttk.Label(
+            exposures, text="Assign the SAME idea group to correlated robots; blank is unverified."
+        ).pack(anchor="w", pady=(0, 8))
+        canvas = tk.Canvas(exposures, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(exposures, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        grid = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=grid, anchor="nw")
+        grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        for column, label in enumerate((
+            "Robot / allocation", "Idea group", "Margin / lot",
+            "Long swap debit / lot / day", "Short swap debit / lot / day",
+        )):
+            ttk.Label(grid, text=label).grid(row=0, column=column, padx=5, pady=5)
+        exposure_vars = {}
+        for position, (row_id, allocation) in enumerate(self.allocations.items(), 1):
+            ttk.Label(grid, text=f"{allocation.index}/{allocation.robot} [{row_id}]").grid(
+                row=position, column=0, sticky="w"
+            )
+            values = self.exposure_inputs.get(row_id, default_exposure())
+            row_vars = {}
+            for column, field in enumerate((
+                "idea_group", "margin_per_lot", "swap_long_debit", "swap_short_debit",
+            ), 1):
+                variable = tk.StringVar(value=values[field])
+                row_vars[field] = variable
+                ttk.Entry(grid, textvariable=variable, width=20).grid(
+                    row=position, column=column, padx=4, pady=3
+                )
+            exposure_vars[row_id] = row_vars
+
+        def apply() -> None:
+            try:
+                raw_profile = {key: variable.get() for key, variable in variables.items()}
+                raw_profile["enabled"] = enabled.get()
+                profile = validate_profile(raw_profile)
+                inputs = {
+                    row_id: validate_exposure({key: var.get() for key, var in row.items()})
+                    for row_id, row in exposure_vars.items()
+                    if row_id in self.allocations
+                }
+            except ValueError as error:
+                messagebox.showerror("Advanced risk inputs", str(error), parent=window)
+                return
+            self.risk_profile = profile
+            self.exposure_inputs = inputs
+            self.generated_scenario = None
+            self.generated_output = ""
+            self.output_text.delete("1.0", "end")
+            self._calculate_portfolio(show_error=False)
+            self._schedule_autosave()
+            self.status_var.set("Advanced risk inputs applied; regenerate estimates with the new assumptions.")
+            window.destroy()
+
+        ttk.Button(window, text="Apply and save with portfolio", command=apply).pack(pady=8)
+
+    def _import_equity_curve(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Sampled account equity CSV: timestamp,balance,equity",
+            filetypes=(("Equity curve", "*.csv"),), parent=self,
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+            "Confirm equity-curve assumptions",
+            "Use only a single-account/tester curve in the configured account currency, "
+            "without deposits or withdrawals. The initial account capital must be the "
+            "original test/account balance. For trailing mode, high-water equity must "
+            "be the value AT THE START of this curve.\n\n"
+            "The CSV needs explicit timezone offsets and reset-time samples. It is "
+            "not an automatically reconstructed equity curve from a trade/deal list.\n\n"
+            "Have you verified these assumptions?",
+            parent=self,
+        ):
+            return
+        try:
+            if os.path.getsize(path) > 10 * 1024 * 1024:
+                raise ValueError("Equity CSV exceeds the 10 MiB limit.")
+            with open(path, encoding="utf-8-sig") as file:
+                samples = parse_equity_csv(file.read())
+            report = self._evaluate_and_save_equity_curve(samples)
+        except (OSError, UnicodeError, ValueError) as error:
+            messagebox.showerror("Equity curve evaluation", str(error), parent=self)
+            self.status_var.set(f"Equity curve evaluation failed: {error}")
+            return
+        self._show_equity_report(report)
+        self.status_var.set(f"Sampled equity report saved locally: {self.equity_report_path}")
+
+    def _show_equity_report(self, report: str) -> None:
+        window = tk.Toplevel(self)
+        window.title("Sampled MT5 equity validation")
+        window.geometry("1000x650")
+        text = tk.Text(window, wrap="word")
+        scrollbar = ttk.Scrollbar(window, command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", report)
+        text.configure(state="disabled")
+
+    def _open_saved_equity_report(self) -> None:
+        try:
+            with open(self.equity_report_path, encoding="utf-8") as file:
+                snapshot = json.load(file)
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("report"), str):
+                raise ValueError("Saved equity report has an invalid format.")
+            report = (
+                f"OFFLINE SNAPSHOT evaluated at {snapshot.get('evaluated_at', 'unknown')}.\n"
+                "This report retains its original rules/curve; it is NOT recalculated "
+                "for today's inputs or current candidate settings.\n\n" + snapshot["report"]
+            )
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Saved equity report", str(error), parent=self)
+            return
+        self._show_equity_report(report)
+
+    def _evaluate_and_save_equity_curve(self, samples: tuple[EquitySample, ...]) -> str:
+        profile = validate_profile(self.risk_profile)
+        capital = decimal_value(self.account_capital_var.get(), "Initial account capital")
+        daily = decimal_value(self.daily_limit_var.get(), "Daily limit")
+        if capital <= ZERO or daily <= ZERO:
+            raise ValueError("Initial capital and daily limit must be positive.")
+        if self.limit_mode_var.get() == "Percent of account":
+            daily = capital * daily / ONE_HUNDRED
+        if daily > capital:
+            raise ValueError("Daily loss limit cannot exceed initial capital.")
+        result = evaluate_equity_curve(samples, profile, capital, daily)
+        verdict = "BREACHED" if result.breaches else "UNVERIFIED" if result.missing else "NO SAMPLED BREACH"
+        report = "\n".join((
+            f"SAMPLED EQUITY VERDICT: {verdict}",
+            f"Currency: {self.currency_var.get()}",
+            f"Initial capital: {capital}; baseline: {profile['daily_baseline']}; "
+            f"overall rule: {profile['overall_rule']}; reset: {profile['reset_time']} "
+            f"with fixed UTC offset {profile['utc_offset_minutes']} minutes.",
+            *result.lines, *("UNVERIFIED: " + item for item in result.missing[:100]),
+            *("BREACH: " + item for item in result.breaches[:100]),
+            f"Counts: {len(result.missing)} missing reset/session checks; "
+            f"{len(result.breaches)} sampled breach observations (up to 100 listed each).",
+            "This evaluates the supplied curve, NOT the planner candidate settings. "
+            "It neither runs the EA nor proves future prop compliance.",
+        ))
+        snapshot = {
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "currency": self.currency_var.get(), "initial_balance": str(capital),
+            "daily_limit": str(daily), "risk_profile": dict(profile),
+            "samples": [
+                {"timestamp": sample.time.isoformat(), "balance": str(sample.balance),
+                 "equity": str(sample.equity)}
+                for sample in samples
+            ],
+            "report": report,
+        }
+        directory = os.path.dirname(self.equity_report_path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory, delete=False
+            ) as file:
+                temporary_path = file.name
+                json.dump(snapshot, file, indent=2)
+            os.replace(temporary_path, self.equity_report_path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return report
+
+    def _open_prop_website_import(self) -> None:
+        if self.prop_import_window is not None and self.prop_import_window.winfo_exists():
+            self.prop_import_window.lift()
+            return
+        window = tk.Toplevel(self)
+        self.prop_import_window = window
+        window.title("Import prop website - review required")
+        window.geometry("1000x650")
+        window.transient(self)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        self.prop_url_var = tk.StringVar(value="https://spiceprop.com/programs/sweet")
+        ttk.Label(frame, text="Official program URL (HTTPS)").pack(anchor="w")
+        ttk.Entry(frame, textvariable=self.prop_url_var).pack(fill="x")
+        ttk.Button(
+            frame, text="Extract rules from URL", command=self._fetch_prop_website
+        ).pack(anchor="w", pady=6)
+        self.prop_preview_tree = ttk.Treeview(
+            frame, columns=("stage", "daily", "total"), show="headings", height=5
+        )
+        for column, label in (
+            ("stage", "Program / stage (verify)"),
+            ("daily", "Daily %"), ("total", "Total %"),
+        ):
+            self.prop_preview_tree.heading(column, text=label)
+        self.prop_preview_tree.pack(fill="x")
+        self.prop_preview_tree.bind("<<TreeviewSelect>>", self._select_prop_rule)
+        self.prop_evidence = tk.Text(frame, height=6, wrap="word", state="disabled")
+        self.prop_evidence.pack(fill="both", expand=True, pady=6)
+        fields = ttk.Frame(frame)
+        fields.pack(fill="x")
+        self.prop_daily_preview_var = tk.StringVar()
+        self.prop_total_preview_var = tk.StringVar()
+        for label, variable in (
+            ("Confirmed daily %", self.prop_daily_preview_var),
+            ("Confirmed total %", self.prop_total_preview_var),
+        ):
+            ttk.Label(fields, text=label).pack(side="left", padx=4)
+            ttk.Entry(fields, textvariable=variable, width=10).pack(side="left")
+        self.prop_reviewed_var = tk.BooleanVar(value=False)
+        self.prop_new_account_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="I verified the program, stage, account size/currency and limits on the official site.",
+            variable=self.prop_reviewed_var,
+        ).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(
+            frame,
+            text="New account: no losses or open positions; use full nominal loss room.",
+            variable=self.prop_new_account_var,
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=(
+                "Capital/currency come from the Prop firm & account tab: verify them first. "
+                "For existing accounts, enter actual remaining daily AND overall cash room "
+                "there before applying. Only daily/total caps are imported. Trailing equity, "
+                "reset timezone, EA bans, correlated-idea risk and other firm rules are NOT "
+                "validated. No universal website parser or verified EA preset is implied."
+            ),
+            wraplength=940,
+        ).pack(fill="x", pady=6)
+        ttk.Button(
+            frame, text="Apply confirmed limits", command=self._apply_prop_website_rules
+        ).pack(anchor="w")
+        ttk.Button(
+            frame, text="Apply limits + suggest robot settings",
+            command=lambda: self._apply_prop_website_rules(suggest=True),
+        ).pack(anchor="w", pady=4)
+        if self.prop_website_snapshot is None:
+            path = os.path.join(APP_DATA_DIRECTORY, PROP_WEBSITE_FILE_NAME)
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as file:
+                        snapshot = json.load(file)
+                    self.prop_website_snapshot = self._validate_prop_website_snapshot(snapshot)
+                except (OSError, UnicodeError, ValueError) as error:
+                    messagebox.showwarning(
+                        "Saved website rules", f"Could not load saved rules: {error}",
+                        parent=window,
+                    )
+        self._display_prop_website_snapshot()
+
+    @staticmethod
+    def _validate_prop_website_snapshot(snapshot: object) -> PropWebsiteSnapshot:
+        if not isinstance(snapshot, dict):
+            raise ValueError("Invalid saved website reference.")
+
+        def text(mapping: dict, key: str) -> str:
+            value = mapping.get(key)
+            if not isinstance(value, str):
+                raise ValueError(f"Saved website field {key} must be text.")
+            return value
+
+        source = text(snapshot, "source")
+        fetched_at = text(snapshot, "fetched_at")
+        candidates = snapshot.get("candidates")
+        if not isinstance(candidates, list) or not 1 <= len(candidates) <= 100:
+            raise ValueError("Invalid saved website rule rows.")
+        normalized: list[PropRuleCandidate] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ValueError("Invalid saved website rule.")
+            row: PropRuleCandidate = {
+                "stage": text(candidate, "stage"),
+                "daily_percent": text(candidate, "daily_percent"),
+                "total_percent": text(candidate, "total_percent"),
+                "evidence": text(candidate, "evidence"),
+            }
+            daily = decimal_value(row["daily_percent"], "Daily percentage")
+            total = decimal_value(row["total_percent"], "Total percentage")
+            if not ZERO < daily <= total < ONE_HUNDRED:
+                raise ValueError("Saved rule percentages are invalid.")
+            normalized.append(row)
+        return {"source": source, "fetched_at": fetched_at, "candidates": normalized}
+
+    def _display_prop_website_snapshot(self) -> None:
+        if (
+            self.prop_website_snapshot is None or self.prop_import_window is None
+            or not self.prop_import_window.winfo_exists()
+        ):
+            return
+        snapshot = self.prop_website_snapshot
+        self.prop_url_var.set(snapshot["source"])
+        self.prop_preview_tree.delete(*self.prop_preview_tree.get_children())
+        self.prop_daily_preview_var.set("")
+        self.prop_total_preview_var.set("")
+        self.prop_reviewed_var.set(False)
+        self.prop_new_account_var.set(False)
+        for index, row in enumerate(snapshot["candidates"]):
+            self.prop_preview_tree.insert(
+                "", "end", iid=str(index),
+                values=(row["stage"], row["daily_percent"], row["total_percent"]),
+            )
+        self.prop_evidence.configure(state="normal")
+        self.prop_evidence.delete("1.0", "end")
+        self.prop_evidence.insert(
+            "1.0", f"Source: {snapshot['source']}\nFetched: {snapshot['fetched_at']}\n"
+            "Select a row to view evidence. Extraction is unverified."
+        )
+        self.prop_evidence.configure(state="disabled")
+
+    def _select_prop_rule(self, _event: object = None) -> None:
+        selected = self.prop_preview_tree.selection()
+        if not selected or self.prop_website_snapshot is None:
+            return
+        row = self.prop_website_snapshot["candidates"][int(selected[0])]
+        self.prop_daily_preview_var.set(row["daily_percent"])
+        self.prop_total_preview_var.set(row["total_percent"])
+        self.prop_reviewed_var.set(False)
+        self.prop_evidence.configure(state="normal")
+        self.prop_evidence.delete("1.0", "end")
+        self.prop_evidence.insert(
+            "1.0", f"Source: {self.prop_website_snapshot['source']}\n"
+            f"Fetched: {self.prop_website_snapshot['fetched_at']}\n{row['evidence']}"
+        )
+        self.prop_evidence.configure(state="disabled")
+
+    def _fetch_prop_website(self) -> None:
+        if self.quote_busy:
+            self.status_var.set("Wait for the current data request to finish.")
+            return
+        url = self.prop_url_var.get()
+        self.prop_reviewed_var.set(False)
+        self.prop_preview_tree.selection_remove(self.prop_preview_tree.selection())
+        self._set_fetch_busy(True)
+        self.status_var.set("Extracting program website tables; review will be required...")
+
+        def worker() -> None:
+            try:
+                result = fetch_prop_website(url)
+            except (ValueError, OSError) as error:
+                result = str(error)
+            self.quote_messages.put(("__prop__", "prop_website_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_quote_result)
+
+    def _apply_prop_website_rules(self, suggest: bool = False) -> None:
+        try:
+            if self.quote_busy:
+                raise ValueError("Wait for the data request to finish before applying rules.")
+            if not self.prop_reviewed_var.get() or not self.prop_preview_tree.selection():
+                raise ValueError("Select a row and confirm that you verified its rules.")
+            daily = decimal_value(self.prop_daily_preview_var.get(), "Daily percentage")
+            total = decimal_value(self.prop_total_preview_var.get(), "Total percentage")
+            capital = decimal_value(self.account_capital_var.get(), "Account capital")
+            if capital <= ZERO or not ZERO < daily <= total < ONE_HUNDRED:
+                raise ValueError("Capital must be positive; require 0 < daily <= total < 100%.")
+            if not self.currency_var.get().strip():
+                raise ValueError("Confirm the account currency first.")
+            daily_cash = capital * daily / ONE_HUNDRED
+            total_cash = capital * total / ONE_HUNDRED
+            if not self.prop_new_account_var.get():
+                remaining_daily = decimal_value(
+                    self.remaining_daily_loss_room_var.get(), "Remaining daily room"
+                )
+                remaining_total = decimal_value(
+                    self.prop_total_loss_room_var.get(), "Remaining total room"
+                )
+                if not (
+                    ZERO < remaining_daily <= daily_cash
+                    and ZERO < remaining_total <= total_cash
+                ):
+                    raise ValueError(
+                        "Enter positive actual remaining rooms no larger than nominal limits."
+                    )
+            if not messagebox.askyesno(
+                "Apply reviewed prop limits",
+                f"Apply daily {daily}% and total {total}% to capital {capital} "
+                f"{self.currency_var.get()}?\nOnly the modeled loss caps are imported. "
+                "This does not verify all firm rules or robot compliance.",
+                parent=self.prop_import_window,
+            ):
+                return
+            self.daily_limit_var.set(str(daily))
+            self.limit_mode_var.set("Percent of account")
+            if self.prop_new_account_var.get():
+                self.remaining_daily_loss_room_var.set(str(daily_cash))
+                self.prop_total_loss_room_var.set(str(total_cash))
+            self.generated_scenario = None
+            self.generated_output = ""
+            self.output_text.delete("1.0", "end")
+            self._calculate_portfolio(show_error=False)
+            self._schedule_autosave()
+            self.prop_import_window.destroy()
+            self.status_var.set(
+                "Reviewed prop caps applied. Configure robots, contract specs and "
+                "history, then use Suggest all robots. Full firm compliance is not verified."
+            )
+            if suggest:
+                self._suggest_portfolio_downside()
+        except ValueError as error:
+            messagebox.showerror("Prop website rules", str(error), parent=self.prop_import_window)
+
+    def _build_spiceprop_reference(self) -> None:
+        reference = SPICEPROP_SWEET_REFERENCE
+        box = ttk.LabelFrame(
+            self.prop_account_tab,
+            text=f"{reference['program']} - saved offline reference",
+            padding=8,
+        )
+        box.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            box,
+            text=(
+                f"Verified: {reference['verified_on']}. Account sizes (EUR): "
+                + ", ".join(str(size) for size in reference["account_sizes"])
+                + ". 1000 EUR is NOT offered by this program."
+            ),
+            wraplength=1050,
+        ).pack(fill="x")
+        columns = ("capital", "phase", "daily", "total", "target")
+        self.spiceprop_reference_tree = ttk.Treeview(
+            box, columns=columns, show="headings", height=3, selectmode="none"
+        )
+        for column, title in zip(
+            columns,
+            ("Capital", "Stage", "Daily loss limit", "Total loss limit", "Profit target"),
+        ):
+            self.spiceprop_reference_tree.heading(column, text=title)
+            self.spiceprop_reference_tree.column(column, width=180, anchor="w")
+        capital = Decimal("25000")
+
+        def limit_text(percent: str) -> str:
+            cash = capital * Decimal(percent) / ONE_HUNDRED
+            return f"{percent}% / {cash:f} EUR"
+
+        for phase, daily, total, target in reference["phases"]:
+            self.spiceprop_reference_tree.insert(
+                "", "end",
+                values=(
+                    "25000 EUR", phase, limit_text(daily), limit_text(total),
+                    limit_text(target) if target is not None else "No evaluation target",
+                ),
+            )
+        self.spiceprop_reference_tree.pack(fill="x", pady=5)
+        ttk.Label(
+            box,
+            text=(
+                f"Funded: max {reference['funded_idea_risk_percent']}% risk per trading "
+                "idea, including correlated exposures. This rule is NOT checked by "
+                "the planner. Daily reset and firm-specific equity rules are NOT "
+                "implemented. The site states 23:59:59 'CET (UTC+2)'; confirm the "
+                "actual timezone with the firm. Nominal limits assume no losses; "
+                "enter actual remaining room for an existing account. Reference "
+                "only: it does not overwrite your account or certify compliance. "
+                "Rules can change; confirm them before trading.\n"
+                f"Sources: {reference['source']}\n{reference['rules_source']}"
+            ),
+            wraplength=1050,
+        ).pack(fill="x")
+
+    def _build_portfolio_tab(self) -> None:
+        ttk.Label(
+            self.portfolio_tab,
+            text=(
+                "Account capital, currency and prop loss limits are configured in "
+                "the Prop firm & account tab. Enter each robot as a percentage "
+                "of account capital; percentages may total up to 100%."
+            ),
+            wraplength=1050,
+        ).pack(fill="x", pady=(0, 10))
         entry_box = ttk.LabelFrame(
             self.portfolio_tab,
             text="Add an index / robot allocation",
@@ -2802,6 +3726,28 @@ class RiskCalculatorApp(tk.Tk):
             command=self._fetch_mt5_terminal_data,
         )
         self.fetch_mt5_button.pack(side="left", padx=8)
+        ttk.Button(
+            self.portfolio_tab, text="Data status", command=self._show_data_status
+        ).pack(anchor="w", pady=4)
+        terminal_box = ttk.LabelFrame(self.portfolio_tab, text="MT5 connection", padding=6)
+        terminal_box.pack(fill="x", pady=4)
+        ttk.Label(terminal_box, text="Terminal .exe (empty = automatic):").pack(side="left")
+        ttk.Entry(
+            terminal_box, textvariable=self.mt5_terminal_path_var, width=40,
+            state="readonly",
+        ).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(
+            terminal_box, text="Choose...", command=self._choose_mt5_terminal
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            terminal_box, text="Automatic",
+            command=self._use_automatic_mt5_terminal,
+        ).pack(side="left", padx=3)
+        self.inspect_mt5_button = ttk.Button(
+            terminal_box, text="Inspect terminal / symbols",
+            command=self._inspect_mt5_terminal,
+        )
+        self.inspect_mt5_button.pack(side="left", padx=3)
         ttk.Label(
             actions,
             text=f"Auto-saved JSON: {self.autosave_path}",
@@ -2895,6 +3841,187 @@ class RiskCalculatorApp(tk.Tk):
             ),
             wraplength=1080,
         ).pack(fill="x", pady=(3, 0))
+
+    def _data_status_text(self) -> str:
+        lines = [
+            "MARKET DATA STATUS",
+            "Requested window: 5 years. Actual coverage is shown per allocation.",
+            "No terminal/server identity is stored in legacy snapshots. Verify "
+            "the active broker/server in MT5; equal specs do not prove equal brokers.",
+            "",
+        ]
+        if self.mt5_connection:
+            lines.append("CURRENT SESSION MT5 INSPECTION (not a saved account snapshot)")
+            lines.extend(
+                f"{key}: {value}"
+                for key, value in self.mt5_connection.items()
+                if key != "symbols"
+            )
+            lines.extend(("", "AVAILABLE BROKER SYMBOLS:", self.mt5_connection["symbols"], ""))
+        for row_id, allocation in self.allocations.items():
+            contract = self._contract_inputs_for_allocation(row_id)
+            stress = self.historical_stresses.get(row_id)
+            lines.append(
+                f"{row_id} | {allocation.index} | {allocation.robot} | "
+                f"source: {self.history_sources.get(row_id) or 'not loaded'}"
+            )
+            quote = self.quotes.get(row_id)
+            lines.append(
+                f"Quote: {quote[0]} {quote[1]} ({quote[3]})"
+                if quote else "Quote: MISSING"
+            )
+            if stress:
+                lines.append(
+                    f"History: {stress.start_date} to {stress.end_date}; "
+                    f"{stress.bar_count} daily bars"
+                )
+                lines.extend(f"WARNING: {item}" for item in history_quality_warnings(stress))
+            else:
+                lines.append("History: MISSING")
+            required = (
+                "point_value", "point_size", "lot_increment", "minimum_lot",
+                "contract_currency",
+            )
+            missing = [field for field in required if not contract.get(field)]
+            lines.append("Missing contract fields: " + (", ".join(missing) or "none"))
+            lines.append(
+                "EA points per pip: " + (contract.get("points_per_pip") or "MISSING")
+            )
+            lines.append(
+                "Round-turn commission per lot: "
+                + (contract.get("commission_per_lot") or
+                   f"shared fallback {self.commission_per_lot_var.get()} (verify manually)")
+            )
+            currency = contract.get("contract_currency", "")
+            if currency.upper() != self.currency_var.get().strip().upper():
+                lines.append("WARNING: contract/account currencies do not match.")
+            if row_id in self.cached_data_warnings:
+                lines.append(f"Refresh warning: {self.cached_data_warnings[row_id]}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _show_data_status(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Market data status")
+        window.geometry("950x600")
+        symbols = self.mt5_connection.get("symbols", "").splitlines()
+        if symbols:
+            chooser = ttk.Frame(window, padding=6)
+            chooser.pack(fill="x")
+            ttk.Label(chooser, text="MT5 symbol for a NEW allocation:").pack(side="left")
+            selected = tk.StringVar(value=symbols[0])
+            ttk.Combobox(
+                chooser, textvariable=selected, values=symbols, height=12, width=35
+            ).pack(side="left", padx=8)
+            ttk.Button(
+                chooser, text="Use in Portfolio",
+                command=lambda: self._use_mt5_symbol(selected.get()),
+            ).pack(side="left")
+        text = tk.Text(window, wrap="word")
+        scrollbar = ttk.Scrollbar(window, command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", self._data_status_text())
+        text.configure(state="disabled")
+
+    def _use_mt5_symbol(self, symbol: str) -> None:
+        if symbol not in self.mt5_connection.get("symbols", "").splitlines():
+            messagebox.showerror(
+                "MT5 symbol", "Select an exact symbol returned by the inspected terminal.",
+                parent=self,
+            )
+            return
+        self.index_var.set(symbol)
+        self.notebook.select(self.portfolio_tab)
+        self.status_var.set(
+            f"Selected {symbol} for a new allocation. Choose robot/percentage and Add; "
+            "existing allocations were not changed."
+        )
+
+    def _load_mt5_config(self) -> None:
+        if not os.path.isfile(self.mt5_config_path):
+            return
+        try:
+            with open(self.mt5_config_path, encoding="utf-8") as file:
+                config = json.load(file)
+            if not isinstance(config, dict) or not isinstance(config.get("terminal_path"), str):
+                raise ValueError("MT5 configuration requires a terminal_path string.")
+            self.mt5_terminal_path_var.set(config["terminal_path"])
+        except (OSError, ValueError) as error:
+            messagebox.showwarning("MT5 configuration", str(error), parent=self)
+
+    def _save_mt5_config(self) -> None:
+        path = self.mt5_terminal_path_var.get().strip()
+        if path and (not os.path.isfile(path) or not path.lower().endswith(".exe")):
+            raise ValueError("Choose the installed MT5 terminal .exe, or leave the path empty.")
+        directory = os.path.dirname(self.mt5_config_path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory, delete=False
+            ) as file:
+                temporary_path = file.name
+                json.dump({"terminal_path": path}, file, indent=2)
+            os.replace(temporary_path, self.mt5_config_path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def _choose_mt5_terminal(self) -> None:
+        if self.quote_busy:
+            self.status_var.set("Wait for the current request before changing terminals.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select MT5 terminal executable",
+            filetypes=[("MT5 terminal", "*.exe")], parent=self,
+        )
+        if path:
+            self.mt5_terminal_path_var.set(path)
+            self.mt5_connection.clear()
+            try:
+                self._save_mt5_config()
+            except (OSError, ValueError) as error:
+                messagebox.showerror("MT5 configuration", str(error), parent=self)
+
+    def _use_automatic_mt5_terminal(self) -> None:
+        if self.quote_busy:
+            self.status_var.set("Wait for the current request before changing terminals.")
+            return
+        self.mt5_terminal_path_var.set("")
+        self.mt5_connection.clear()
+        try:
+            self._save_mt5_config()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("MT5 configuration", str(error), parent=self)
+
+    def _inspect_mt5_terminal(self) -> None:
+        if self.quote_busy:
+            return
+        try:
+            self._save_mt5_config()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("MT5 configuration", str(error), parent=self)
+            return
+        path = self.mt5_terminal_path_var.get().strip()
+        symbols = tuple(allocation.index for allocation in self.allocations.values())
+        self._set_fetch_busy(True)
+        self.status_var.set("Reading MT5 terminal identity and available symbols...")
+
+        def worker() -> None:
+            try:
+                data = inspect_mt5_terminal(path, requested_symbols=symbols)
+                result = MT5InspectionResult(data)
+            except (
+                ValueError, OSError, TypeError, AttributeError, RuntimeError,
+                InvalidOperation, OverflowError,
+            ) as error:
+                result = MT5InspectionResult({}, str(error))
+            self.quote_messages.put(("__mt5_status__", "mt5_status_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_quote_result)
 
     def _build_settings_tab(self) -> None:
         top = ttk.LabelFrame(
@@ -3364,6 +4491,7 @@ class RiskCalculatorApp(tk.Tk):
         self.history_sources.pop(row_id, None)
         self.magic_assignments.pop(row_id, None)
         self.contract_inputs.pop(row_id, None)
+        self.exposure_inputs.pop(row_id, None)
         self.saved_quote_rows.discard(row_id)
         self.saved_history_rows.discard(row_id)
         if self.current_settings_row == row_id:
@@ -3622,6 +4750,28 @@ class RiskCalculatorApp(tk.Tk):
                 )
             costs[2] = override
         return costs[0], costs[1], costs[2]
+
+    def _sizing_costs(
+        self, row_id: str, contract: ContractFields
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        spread, slippage, commission = self._transaction_costs(contract)
+        if not self.risk_profile["enabled"]:
+            return spread, slippage, commission
+        days = int(self.risk_profile["holding_days"])
+        field = (
+            "swap_short_debit" if self.position_direction_var.get() == "Short (price rises)"
+            else "swap_long_debit"
+        )
+        inputs = self.exposure_inputs.get(row_id, default_exposure())
+        if days and not inputs[field]:
+            raise ValueError(
+                f"{self.allocations[row_id].index}: enter verified {field} in "
+                "account cash per lot per charge-day (0 only if verified)."
+            )
+        swap = decimal_value(inputs[field] or "0", "Swap debit")
+        if swap < ZERO:
+            raise ValueError("Swap must be a non-negative debit; credits are not used for sizing.")
+        return spread, slippage, commission + swap * days
 
     def _load_contract_inputs(self, row_id: str) -> None:
         fields = self.contract_inputs.get(row_id, {})
@@ -4012,11 +5162,45 @@ class RiskCalculatorApp(tk.Tk):
             raise ValueError(
                 "Remaining prop total-loss room cannot exceed total account capital."
             )
+        if self.risk_profile["enabled"]:
+            profile_daily, profile_total = remaining_rooms(
+                self.risk_profile, account_capital, daily_limit
+            )
+            if profile_daily <= ZERO or profile_total <= ZERO:
+                raise ValueError(
+                    "Configured prop equity floor is already reached/breached; "
+                    "no loss room is available for new candidates."
+                )
+            remaining_daily_room = min(
+                remaining_daily_room if remaining_daily_room is not None else profile_daily,
+                profile_daily,
+            )
+            prop_loss_room = min(
+                prop_loss_room if prop_loss_room is not None else profile_total,
+                profile_total,
+            )
         effective_cap = effective_portfolio_risk_cap(
             daily_limit,
             remaining_daily_room,
             prop_loss_room,
         )
+        if self.risk_profile["enabled"] and self.risk_profile["idea_limit_pct"]:
+            groups: dict[str, Decimal] = {}
+            for row_id, allocation in self.allocations.items():
+                group = self.exposure_inputs.get(row_id, default_exposure())["idea_group"]
+                if not group:
+                    continue
+                percent = self.allocation_percentages.get(row_id)
+                capital = (
+                    account_capital * percent / ONE_HUNDRED
+                    if percent is not None else allocation.capital
+                )
+                groups[group.casefold()] = groups.get(group.casefold(), ZERO) + capital
+            idea_cap = account_capital * decimal_value(
+                self.risk_profile["idea_limit_pct"], "Per-idea loss limit"
+            ) / ONE_HUNDRED
+            for capital in groups.values():
+                effective_cap = min(effective_cap, idea_cap * account_capital / capital)
         return (
             account_capital,
             daily_limit,
@@ -4133,6 +5317,7 @@ class RiskCalculatorApp(tk.Tk):
         ]
         endpoint = self.broker_api_endpoint_var.get().strip()
         account_currency = self.currency_var.get().strip().upper()
+        terminal_path = self.mt5_terminal_path_var.get().strip()
         self._set_fetch_busy(True)
         self.status_var.set("Refreshing saved market data at startup...")
 
@@ -4150,7 +5335,10 @@ class RiskCalculatorApp(tk.Tk):
                 ):
                     try:
                         if source == "MT5 terminal":
-                            currency, data = fetch_mt5_terminal_data([symbol])
+                            currency, data = (
+                                fetch_mt5_terminal_data([symbol], terminal_path=terminal_path)
+                                if terminal_path else fetch_mt5_terminal_data([symbol])
+                            )
                             status = "startup_mt5_done"
                         else:
                             currency, data = fetch_broker_api_data(
@@ -4244,6 +5432,7 @@ class RiskCalculatorApp(tk.Tk):
             (row_id, allocation.index)
             for row_id, allocation in self.allocations.items()
         ]
+        terminal_path = self.mt5_terminal_path_var.get().strip()
         self._set_fetch_busy(True)
         self.status_var.set(
             "Connecting to the logged-in MT5 terminal for contract specs and "
@@ -4255,6 +5444,7 @@ class RiskCalculatorApp(tk.Tk):
                 account_currency, symbols = fetch_mt5_terminal_data(
                     [symbol for _, symbol in requested_rows],
                     history_years=5,
+                    terminal_path=terminal_path,
                 )
                 rows = {
                     row_id: symbols[symbol.strip().upper()]
@@ -4386,6 +5576,8 @@ class RiskCalculatorApp(tk.Tk):
             self.fetch_all_button.configure(state=state)
         if self.fetch_mt5_button is not None:
             self.fetch_mt5_button.configure(state=state)
+        if self.inspect_mt5_button is not None:
+            self.inspect_mt5_button.configure(state=state)
         if self.fetch_broker_api_button is not None:
             self.fetch_broker_api_button.configure(state=state)
 
@@ -4403,11 +5595,69 @@ class RiskCalculatorApp(tk.Tk):
                 "mt5_done",
                 "broker_api_done",
                 "startup_done",
+                "prop_website_done",
+                "mt5_status_done",
             ):
                 self._set_fetch_busy(False)
                 self.quote_request_cancelled = False
             else:
                 self.after(100, self._poll_quote_result)
+            return
+        if status == "mt5_status_done":
+            self._set_fetch_busy(False)
+            if not isinstance(result, MT5InspectionResult):
+                self.status_var.set("MT5 inspection returned an invalid result.")
+                messagebox.showerror(
+                    "MT5 connection", "Invalid inspection result format.", parent=self
+                )
+                return
+            if result.error:
+                self.mt5_connection.clear()
+                self.status_var.set(f"MT5 inspection failed: {result.error}")
+                messagebox.showerror("MT5 connection", result.error, parent=self)
+                return
+            data = result.connection
+            self.mt5_connection = data
+            self.status_var.set(
+                f"MT5 {data['account_type']} | {data['broker']} | "
+                f"{data['server']} | {data['currency']}."
+            )
+            self._show_data_status()
+            return
+        if status == "prop_website_done":
+            self._set_fetch_busy(False)
+            temporary_path = ""
+            try:
+                if isinstance(result, str):
+                    raise ValueError(result)
+                snapshot = self._validate_prop_website_snapshot(result)
+                os.makedirs(APP_DATA_DIRECTORY, exist_ok=True)
+                descriptor, temporary_path = tempfile.mkstemp(
+                    prefix=".prop-website-", suffix=".tmp", dir=APP_DATA_DIRECTORY,
+                    text=True,
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                    json.dump(snapshot, file, ensure_ascii=False, indent=2)
+                    file.write("\n")
+                os.replace(
+                    temporary_path,
+                    os.path.join(APP_DATA_DIRECTORY, PROP_WEBSITE_FILE_NAME),
+                )
+                temporary_path = ""
+                self.prop_website_snapshot = snapshot
+                self._display_prop_website_snapshot()
+                self.status_var.set(
+                    "Website rule candidates saved locally. Select and verify a "
+                    "program/stage before applying; account values are unchanged."
+                )
+            except (ValueError, OSError, TypeError) as error:
+                self.status_var.set(f"Program website import failed: {error}")
+                messagebox.showerror(
+                    "Program website import", str(error), parent=self
+                )
+            finally:
+                if temporary_path and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
             return
         if status == "startup_done":
             self._set_fetch_busy(False)
@@ -4459,16 +5709,33 @@ class RiskCalculatorApp(tk.Tk):
                     parent=self,
                 )
                 return
-            self.currency_var.set(result.account_currency)
+            currency = self.currency_var.get().strip().upper()
+            if result.account_currency.strip().upper() != currency:
+                error = (
+                    f"{source_name} currency {result.account_currency} does not match "
+                    f"the configured account currency {currency or '(empty)'}. "
+                    "No data or cash amounts were changed. Configure a matching "
+                    "account currency and re-enter all capital/loss-room amounts "
+                    "in that currency before reconnecting; no FX conversion is assumed."
+                )
+                self.status_var.set(error)
+                messagebox.showerror("Account currency mismatch", error, parent=self)
+                if startup:
+                    self.after(100, self._poll_quote_result)
+                return
+            contract_warnings = []
             for row_id, symbol_data in result.rows.items():
                 if row_id not in self.allocations:
                     continue
-                contract = dict(symbol_data.contract)
-                if startup:
-                    saved_contract = self.contract_inputs.get(row_id, {})
-                    for field in ("points_per_pip", "commission_per_lot"):
-                        if not contract.get(field):
-                            contract[field] = saved_contract.get(field, "")
+                contract, review_required = merge_refreshed_contract(
+                    self._contract_inputs_for_allocation(row_id), symbol_data.contract
+                )
+                if review_required:
+                    contract_warnings.append(
+                        f"{self.allocations[row_id].index}: contract specifications "
+                        "changed. Re-enter EA pip conversion and commission; old "
+                        "manual values were not copied to the new contract."
+                    )
                 self.contract_inputs[row_id] = contract
                 self.history_bars[row_id] = symbol_data.bars
                 self.historical_stresses[row_id] = calculate_historical_stress(
@@ -4496,6 +5763,15 @@ class RiskCalculatorApp(tk.Tk):
                     self._selection_changed()
             self._calculate_portfolio(show_error=False)
             self._schedule_autosave()
+            if contract_warnings:
+                messagebox.showwarning(
+                    "Contract inputs need review", "\n".join(contract_warnings),
+                    parent=self,
+                )
+                self.status_var.set("Contract changed; review manual values before sizing.")
+                if startup:
+                    self.after(100, self._poll_quote_result)
+                return
             if startup:
                 self.status_var.set(
                     f"Updated {source_name} data; finishing startup refresh..."
@@ -4503,10 +5779,21 @@ class RiskCalculatorApp(tk.Tk):
                 self.after(100, self._poll_quote_result)
                 return
             self.status_var.set(
-                f"Read {source_name} contract specs, quotes and five-year D1 history for "
+                f"Read {source_name} contract specs, quotes and available D1 history for "
                 f"{len(result.rows)} allocation(s); account currency "
                 f"{result.account_currency}. Generating the portfolio estimate..."
             )
+            quality = [
+                f"{self.allocations[row_id].index}: {stress.start_date} to "
+                f"{stress.end_date} ({stress.bar_count} daily bars). "
+                + " ".join(history_quality_warnings(stress))
+                for row_id in result.rows
+                if row_id in self.allocations
+                for stress in (self.historical_stresses[row_id],)
+                if history_quality_warnings(stress)
+            ]
+            if quality:
+                self.status_var.set("History coverage warning: " + " | ".join(quality))
             self._suggest_portfolio_downside()
             return
         if status == "one":
@@ -4801,7 +6088,7 @@ class RiskCalculatorApp(tk.Tk):
             allocation_label = f"{allocation.index} [{row_id}]"
             quote_data = self.quotes.get(row_id)
             contract = self._contract_inputs_for_allocation(row_id)
-            _, _, commission_per_lot = self._transaction_costs(contract)
+            _, _, commission_per_lot = self._sizing_costs(row_id, contract)
             if quote_data is None:
                 missing.append(f"{allocation_label}: market reference price not loaded")
                 continue
@@ -5039,7 +6326,7 @@ class RiskCalculatorApp(tk.Tk):
             ZERO,
         )
         (
-            _account,
+            account_capital,
             daily_limit,
             remaining_daily_room,
             prop_loss_room,
@@ -5103,6 +6390,23 @@ class RiskCalculatorApp(tk.Tk):
                 f"{format_decimal(loss, 2):>12}  {status}"
             )
             row_result = self.allocation_results[allocation_id]
+            contract = self._contract_inputs_for_allocation(allocation_id)
+            _, _, row_commission = self._transaction_costs(contract)
+            commission_source = (
+                "symbol override" if contract.get("commission_per_lot", "").strip()
+                else "shared fallback; not supplied by MT5, verify manually"
+            )
+            report.append(
+                f"  Round-turn commission: {format_decimal(row_commission)} "
+                f"{currency}/lot ({commission_source})."
+            )
+            if self.risk_profile["enabled"]:
+                _, _, reserved_cost = self._sizing_costs(allocation_id, contract)
+                report.append(
+                    f"  Overnight debit reserve: {format_decimal(reserved_cost - row_commission)} "
+                    f"{currency}/lot; {self.risk_profile['holding_days']} charge-days "
+                    "reserved on EVERY entry at entry time (no swap credit)."
+                )
             report.append(
                 f"  Allocation ID: {allocation_id}; capital "
                 f"{format_decimal(row_result.allocation.capital, 2)} {currency}; "
@@ -5125,6 +6429,14 @@ class RiskCalculatorApp(tk.Tk):
                     "  WARNING: Yahoo refresh failed; this allocation uses its "
                     f"saved local snapshot. {self.cached_data_warnings[allocation_id]}"
                 )
+            history = self.historical_stresses.get(allocation_id)
+            if history is not None and historical_mode:
+                report.append(
+                    f"  Actual history: {history.start_date} to {history.end_date}; "
+                    f"{history.bar_count} daily bars."
+                )
+                for warning in history_quality_warnings(history):
+                    report.append(f"  HISTORY WARNING: {warning}")
         if include_candidate_settings and rows:
             report.extend(
                 [
@@ -5219,12 +6531,62 @@ class RiskCalculatorApp(tk.Tk):
                     report.append(
                         "Portfolio modeled loss is within the safety-reserved allowance."
                     )
-        if missing or prop_loss_room is None:
+        advanced_missing: tuple[str, ...] = ()
+        advanced_breaches: tuple[str, ...] = ()
+        if self.risk_profile["enabled"]:
+            checks = check_exposures(
+                self.risk_profile, account_capital,
+                tuple(
+                    ModeledExposure(
+                        f"{row[0]} [{row[-1]}]", row[4], row[3], row[5],
+                        self.exposure_inputs.get(row[-1], default_exposure()),
+                    )
+                    for row in rows
+                ),
+            )
+            advanced_missing, advanced_breaches = checks.missing, checks.breaches
+            report.extend((
+                "",
+                "ADVANCED PROP / MARGIN CONSTRAINTS",
+                f"Overall rule: {self.risk_profile['overall_rule']}; "
+                f"daily baseline: {self.risk_profile['daily_baseline']}; reset "
+                f"{self.risk_profile['reset_time']} at fixed UTC offset "
+                f"{self.risk_profile['utc_offset_minutes']} minutes (no DST).",
+                "Multi-day grid sizing keeps the tighter current daily/overall room "
+                "for the ENTIRE episode; daily resets never replenish its risk budget.",
+                "Margin uses configured worst-case cash/lot and simultaneous maximum "
+                "grid exposure; broker netting, hedged discounts and price-dependent "
+                "margin are not inferred. Existing positions must be included in "
+                "the entered margin, equity and remaining loss room.",
+                *checks.lines,
+                *("ADVANCED MISSING: " + item for item in checks.missing),
+                *("ADVANCED BREACH: " + item for item in checks.breaches),
+            ))
+        else:
+            report.append(
+                "ADVANCED CHECKS DISABLED: verdict excludes margin, swap, per-idea "
+                "groups and explicit reset/static/trailing equity rules. Enable "
+                "'Advanced prop, margin & swap' to include them."
+            )
+        history_unverified = historical_mode and any(
+            history_quality_warnings(self.historical_stresses[row[-1]])
+            for row in rows
+            if row[-1] in self.historical_stresses
+        )
+        if advanced_breaches:
+            report.append(
+                "PORTFOLIO VERDICT: REJECTED — advanced margin/idea constraints "
+                "breached: " + "; ".join(advanced_breaches)
+            )
+        elif missing or prop_loss_room is None or history_unverified or advanced_missing:
             if missing:
                 report.append("Not included (missing data): " + "; ".join(missing))
             report.append(
                 "PORTFOLIO VERDICT: UNVERIFIED — complete market/contract data "
-                "and remaining prop overall-loss room are required for acceptance."
+                "and remaining prop overall-loss room are required for acceptance. "
+                "Historical modes also require recent, sufficiently populated "
+                "five-year coverage (see HISTORY WARNING). Enabled advanced "
+                "checks require all ADVANCED MISSING inputs."
             )
         elif rows:
             if total_estimated_loss <= portfolio_working_allowance:
@@ -5296,8 +6658,8 @@ class RiskCalculatorApp(tk.Tk):
         allocation_result = self.allocation_results[row_id]
         allocation = allocation_result.allocation
         contract = self._contract_inputs_for_allocation(row_id)
-        spread_points, slippage_points, commission_per_lot = self._transaction_costs(
-            contract
+        spread_points, slippage_points, commission_per_lot = self._sizing_costs(
+            row_id, contract
         )
         for key, variable in self._contract_input_variables().items():
             if not variable.get().strip() and contract.get(key):
@@ -5770,7 +7132,8 @@ class RiskCalculatorApp(tk.Tk):
                 "",
                 f"Transaction-cost model per trade: configured spread floor "
                 f"{format_decimal(spread_points)} points + slippage "
-                f"{format_decimal(slippage_points)} points + round-turn commission "
+                f"{format_decimal(slippage_points)} points + round-turn commission"
+                f"{' including prepaid swap reserve' if self.risk_profile['enabled'] else ''} "
                 f"{format_decimal(commission_per_lot)} per 1.00 lot.",
                 f"Estimated loss at selected settings: "
                 f"{format_decimal(selected_loss, 2)} "
@@ -5961,7 +7324,11 @@ class RiskCalculatorApp(tk.Tk):
             ):
                 raise ValueError(
                     "The portfolio did not pass the configured 80% acceptance "
-                    "threshold; see the risk verdict in the report."
+                    "threshold or enabled advanced constraints. "
+                    + " ".join(
+                        line for line in portfolio_report
+                        if line.startswith(("PORTFOLIO VERDICT:", "ADVANCED BREACH:"))
+                    )
                 )
         output.extend(portfolio_report)
         output.extend(
@@ -5976,7 +7343,9 @@ class RiskCalculatorApp(tk.Tk):
                 "- Candidate sizing's historical replay treats daily OHLC bars as "
                 "independent shocks. The separate chronological campaign model keeps "
                 "grid entries overnight but uses an assumed adverse-first daily path; "
-                "it does not model RSI signals, margin, swap, or exact EA execution.",
+                "it does not model RSI signals, dynamic margin/liquidation, actual "
+                "swap accrual or exact EA execution. Enabled advanced checks add a "
+                "prepaid swap reserve and a separate maximum-exposure margin screen.",
                 "- This tests only the entered adverse move. Gaps, slippage, costs, "
                 "or a larger move can exceed the daily limit.",
                 "- The suggested target price is a stress-test input, not a price "

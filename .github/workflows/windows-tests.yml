@@ -1,0 +1,40 @@
+name: Windows MT5 planner
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Create local Python environment
+        shell: powershell
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { throw "Environment creation failed" }
+      - name: Install MT5 dependencies
+        shell: powershell
+        run: .\Start-RiskPlanner.ps1 -Setup
+      - name: Check deployment environment
+        shell: powershell
+        run: .\Start-RiskPlanner.ps1 -Check
+      - name: Run tests without a live terminal
+        shell: powershell
+        run: |
+          & .\.venv\Scripts\python.exe -m unittest
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
+      - name: Compile Python sources
+        shell: powershell
+        run: |
+          & .\.venv\Scripts\python.exe -m py_compile risk_calculator.py advanced_risk.py risk_calculator_app.pyw test_risk_calculator.py test_advanced_risk.py test_risk_calculator_app.py
+          if ($LASTEXITCODE -ne 0) { throw "Compilation failed" }

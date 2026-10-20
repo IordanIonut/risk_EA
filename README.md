@@ -4,7 +4,51 @@ Aplicație desktop pentru estimarea bugetelor de risc și dimensionarea unor set
 
 ## Pornire și verificare
 
+### Laptop Windows cu MT5 (inclusiv cont demo)
+
+Aplicația și terminalul MT5 trebuie să ruleze pe **același laptop**; conectorul Python nu accesează prin rețea terminalul de pe alt calculator.
+
+Cu acces la repository, pe laptopul nou:
+
+```powershell
+git clone https://github.com/IordanIonut/risk_EA.git
+Set-Location .\risk_EA
+.\Start-RiskPlanner.ps1 -Setup
+.\Start-RiskPlanner.ps1 -Check
+.\Start-RiskPlanner.ps1
+```
+
+Aceste comenzi presupun Git și Python 3.12 x64 instalate și modificările de mai jos publicate în repository. Pentru o clonă existentă, folosește `git pull --ff-only` înainte de `-Setup`; dacă ai modificări locale, rezolvă-le înainte de actualizare, fără a șterge portofoliul. Fișierele private din `data` nu sunt descărcate prin Git și nu trebuie publicate.
+
+Workflow-ul GitHub Actions **Windows MT5 planner** verifică instalarea dependențelor, lansatorul în modul `-Check`, testele Tkinter și compilarea pe Windows/Python 3.12. Rulează la push/PR sau manual din Actions. Nu autentifică un cont MT5 și nu validează tranzacții sau conexiunea reală la broker.
+
+1. Copiază folderul proiectului într-o locație în care poți scrie. Nu copia `.venv` sau `__pycache__`: mediul Python se recreează pe laptopul nou. Dacă vrei portofoliul și istoricul existente, transferă privat și folderul `data` (ignorat de Git), sau folosește **Save scenario / Load scenario**. Nu trimite datele contului într-un repository public.
+2. Instalează **Python 3.12 pe 64 de biți**, cu Python Launcher și Tkinter, apoi terminalul MT5 al brokerului ales. Un cont demo este suficient pentru preluarea datelor disponibile; nu trebuie cumpărat un cont prop.
+3. Deschide PowerShell în folderul proiectului și execută:
+
+   ```powershell
+   .\Start-RiskPlanner.ps1 -Setup
+   ```
+
+   Scriptul creează `.venv` și instalează dependențele din `requirements-mt5.txt`. Nu modifică instalarea globală Python. Dacă politica sistemului blochează scripturile, folosește metoda aprobată de administrator; scriptul nu schimbă politica de execuție.
+4. Pornește MT5 și autentifică-te în contul demo pe serverul corect. Verifică denumirile exacte ale instrumentelor în **Market Watch** (de exemplu `US500.cash` poate fi diferit de `US500`). Pentru istoric lung, mărește **Tools > Options > Charts > Max bars in chart**, deschide graficele D1 și lasă terminalul să descarce istoricul. Serverul poate furniza mai puțin de cinci ani.
+5. Pornește aplicația:
+
+   ```powershell
+   .\Start-RiskPlanner.ps1
+   ```
+
+6. În **Prop firm & account** introdu capitalul ipotetic și limitele prop. În **Portfolio** adaugă simbolurile exacte și procentele, apoi apasă **Connect MT5: get specs + 5y D1**. Indicatorul animat arată că operația este în curs. Conectarea manuală preia valuta contului MT5: aceasta trebuie să corespundă scenariului, deoarece valoarea punctului este exprimată în valuta contului brokerului, nu convertită arbitrar.
+7. Verifică manual **points per EA pip**, Step, Take Profit și comisionul: MT5 nu furnizează convențiile robotului sau comisionul prin proprietățile simbolului. Datele primite se salvează local; următoarea pornire încearcă actualizarea surselor MT5 salvate.
+
+`.\Start-RiskPlanner.ps1 -Check` verifică doar mediul Python și importul MetaTrader5, fără conectare sau tranzacții. Instalarea/folosirea efectivă a terminalului trebuie verificată pe laptopul destinație. Pentru mai multe terminale, deschide și verifică terminalul/contul dorit înainte de conectare; aplicația nu oferă încă un selector al executabilului MT5.
+
+Conectorul plannerului citește date, nu trimite ordine și nu instalează robotul. Datele unui demo de la alt broker sunt potrivite pentru planificare, nu confirmă contractele sau execuția viitorului cont prop. Acest flux nu necesită activarea Algo Trading pentru plasarea de ordine.
+
+- **Import prop rules from website...**, în **Prop firm & account**, permite introducerea unui link HTTPS către pagina oficială a programului. Extragerea locală, fără AI sau cheie API, caută perechi de procente daily/total în tabele HTML în engleză, afișează rândul sursă, URL-ul și data descărcării. Alege programul/etapa, verifică valorile și capitalul/valuta contului, apoi confirmă explicit înainte de aplicare. Pentru cont nou poți bifa folosirea întregului buget nominal; pentru cont existent trebuie completate bugetele cash efectiv rămase. **Apply limits + suggest robot settings** aplică limitele confirmate și pornește recomandarea existentă, care necesită și contractul brokerului, istoricul și parametrii strategiei. Candidații extrași se salvează local în `data\prop_website.json` și se restaurează în fereastra de import; limitele aplicate se salvează cu portofoliul. Nu sunt interpretate automat toate regulile firmei: trailing drawdown, fus orar/resetare zilnică, interdicții EA, corelații sau limita pe idee. Site-urile doar JavaScript, PDF-urile, tabelele verticale sau alte limbi pot necesita completare manuală. Eșecul extragerii nu modifică contul; funcția nu este un configurator universal sau o certificare de conformitate.
+- În **Prop firm & account** este inclusă local o referință **SpiceProp Sweet / Spice 2 Step**, verificată la 20.10.2026, disponibilă fără internet. Tabelul pentru 25.000 EUR păstrează limitele zilnice de 5,5% / 4,5% / 4,5%, limita totală de 11% și țintele de 7,5% / 5% / fără țintă în funded. Sunt afișate sursele, capitalurile disponibile și avertizarea că 1.000 EUR nu aparține acestui program. Referința nu modifică automat contul și nu se actualizează online. Regula funded de 2% pe idee/expuneri corelate și resetarea zilnică specifică firmei rămân neverificate de model; confirmă regulile actuale cu firma.
 - Deschide `risk_calculator_app.pyw` cu Python pe Windows sau rulează `pyw risk_calculator_app.pyw`.
+- Fila **Prop firm & account** grupează capitalul, valuta, limita zilnică (procent sau sumă), limita zilnică rămasă și limita totală prop rămasă. Aceste valori se salvează automat local în `data\portfolio.json` și se restaurează la pornire, inclusiv din scenariile existente. Roboții și alocările rămân în **Portfolio**, iar setările în **Robot settings**. Limitele sunt introduse de utilizator conform regulilor firmei, nu preluate automat de la o firmă prop.
 - Modul standard și importurile CSV folosesc biblioteca standard Python. Conectarea directă la MT5 este opțională și cere pachetul `MetaTrader5`.
 - Portofoliul, contractele introduse și istoricul Yahoo/MT5/API se salvează automat în `data\portfolio.json` lângă aplicație și se reîncarcă la următoarea pornire. Folderul `data\` este ignorat de Git deoarece fișierul poate conține informații private ale contului. Datele autosalvate anterior în `%APPDATA%\MT5RiskPlanner\portfolio.json` sunt migrate automat prima dată. Scenariile salvate manual rămân disponibile separat.
 - La deschidere, după încărcarea portofoliului, aplicația reîmprospătează datele în fundal: Yahoo pentru alocările Yahoo/fără sursă, terminalul pentru sursa **MT5 terminal**, respectiv endpointul salvat pentru **Broker API** (și pentru alocări fără sursă când este configurat un endpoint). Indicatorul animat din bara de stare rămâne vizibil pe durata operației, inclusiv la descărcările manuale. Istoricul CSV nu este înlocuit automat cu Yahoo; se păstrează cu o avertizare pentru reimport/conectare MT5. Dacă o sursă nu răspunde, datele salvate sunt păstrate, celelalte alocări continuă actualizarea și la final apare o avertizare. Tokenurile API nu se salvează: dacă endpointul cere autentificare, introdu tokenul și apasă **Fetch broker data**. Actualizarea la pornire nu schimbă valuta contului și nu generează automat setări EA.
@@ -27,7 +71,7 @@ Scenariile păstrează selecția după poziția alocării în listă, inclusiv p
 
 Fiecare robot nou se adaugă prin procent din capitalul contului. Capitalul alocat este recalculat din procent când se schimbă capitalul contului; procentele alocărilor noi nu pot depăși împreună 100%. Scenariile mai vechi cu alocări introduse în bani rămân compatibile și își păstrează sumele. Raportul împarte limita efectivă proporțional cu capitalul alocat fiecărui robot.
 
-La recomandarea agregată, verdictul este **ACCEPTED** numai când pierderea modelată rămâne în maximum 80% din bugetul alocat și este completată limita totală prop rămasă; peste pragul de 80% apare **NOT ACCEPTED**, iar depășirea bugetului apare **REJECTED**. Lipsa datelor pentru o alocare sau a limitei totale prop face verdictul **UNVERIFIED**. Pentru portofoliile acceptate, raportul include un bloc de setări candidate per alocare (Magic Number, `Max Trades`, lot fix și valorile Step/Take Profit partajate). Setările de strategie rămân cele introduse de utilizator și nu sunt deduse pentru fiecare EA. Acesta este un filtru al modelului istoric configurat, nu aprobarea firmei prop și nici o garanție de risc live. Plannerul calculează lotul și `Max Trades`; păstrează valorile strategice Step, Take Profit și RSI introduse de utilizator, nu le optimizează.
+La recomandarea agregată, verdictul este **ACCEPTED** numai când pierderea modelată rămâne în maximum 80% din bugetul alocat și este completată limita totală prop rămasă; peste pragul de 80% apare **NOT ACCEPTED**, iar depășirea bugetului apare **REJECTED**. Lipsa datelor pentru o alocare sau a limitei totale prop face verdictul **UNVERIFIED**. În modurile istorice, istoricul scurt, rar, vechi sau cu date viitoare produce tot **UNVERIFIED**, chiar dacă pierderea calculată încape în buget. Pentru portofoliile acceptate, raportul include un bloc de setări candidate per alocare (Magic Number, `Max Trades`, lot fix și valorile Step/Take Profit partajate). Setările de strategie rămân cele introduse de utilizator și nu sunt deduse pentru fiecare EA. Acesta este un filtru al modelului istoric configurat, nu aprobarea firmei prop și nici o garanție de risc live. Plannerul calculează lotul și `Max Trades`; păstrează valorile strategice Step, Take Profit și RSI introduse de utilizator, nu le optimizează.
 
 ## Date de contract și istoric MT5
 
@@ -36,6 +80,18 @@ La recomandarea agregată, verdictul este **ACCEPTED** numai când pierderea mod
 3. Exportatoarele scriu în Common Files din MT5. În fișierul de istoric se păstrează simbolul brokerului; importul acceptă și mai multe simboluri în același CSV.
 4. Se cer cel puțin 20 de bare zilnice valide. Barele intraday sunt agregate pe zi (open din prima bară cronologică, high maxim, low minim și ultimul close), inclusiv când rândurile CSV nu sunt ordonate. Open, când există, și close trebuie să fie în intervalul low–high al fiecărei bare, înainte de agregare.
 5. **Suggest all robots (historical drawdown)** reîmprospătează automat istoricul zilnic Yahoo pe ultimii 5 ani pentru alocările care nu au istoric MT5 și păstrează istoricul MT5 importat. Nu este necesar un fișier Excel/CSV pentru istoricul de piață; cotația și barele sunt memorate în JSON-ul local, folosite la pornirea următoare și reîmprospătate la următoarea recomandare agregată. Dacă reîmprospătarea online eșuează, un snapshot Yahoo salvat anterior poate fi folosit cu avertizare în raport. Datele Yahoo pot diferi de CFD-ul brokerului. **Fetch Yahoo data for all** înlocuiește explicit istoricul local cu date Yahoo acolo unde acestea sunt disponibile.
+
+### Verificarea datelor și conexiunii
+
+În **Portfolio**, **Data status** arată pentru fiecare robot sursa, cotația și momentul ei, prima/ultima zi din istoric, numărul barelor și câmpurile de contract lipsă. Raportul agregat include perioada efectivă și comisionul fiecărei alocări, inclusiv folosirea fallback-ului comun. Un răspuns cu 20 de bare nu mai este prezentat ca istoric complet de cinci ani.
+
+Pentru verdict istoric verificat se cer: prima bară cel târziu la 14 zile după începutul ferestrei de cinci ani, ultima bară cu cel mult 7 zile înainte de data UTC curentă, nicio dată viitoare și minimum 1000 de bare zilnice. Pragurile sunt verificări conservatoare de calitate, nu dovada că toate ședințele sau toate mișcările pieței sunt prezente. Istoricul insuficient poate fi păstrat și inspectat, dar nu produce **ACCEPTED** în modurile istorice. Recomandarea agregată automată solicită rezolvarea avertizărilor înainte de a exporta setări acceptate.
+
+În secțiunea **MT5 connection**, **Choose...** selectează executabilul terminalului; **Automatic** revine la detectarea pachetului MT5. Preferința se salvează local în `data\mt5_connection.json` și este folosită atât la conectarea manuală, cât și la refresh-ul de pornire. **Inspect terminal / symbols** citește în fundal brokerul, serverul, tipul DEMO/CONTEST/REAL, valuta, leverage-ul, marja liberă și lista exactă de simboluri, apoi deschide **Data status**. Această inspecție este informativă și rămâne numai în sesiunea curentă; nu salvează login/parole și nu plasează ordine. Marja liberă afișată nu este încă un calcul de marjă al gridului.
+
+Conectările MT5 și REST resping o valută diferită de cea a contului configurat, fără a modifica sumele sau datele existente. Nu există conversie valutară implicită: pentru altă valută, reintrodu explicit capitalul și limitele cash corespunzătoare înainte de reconectare.
+
+La refresh MT5/REST se păstrează conversia pip și comisionul manual când valorile lipsesc din răspuns și specificațiile numerice ale contractului/valuta nu s-au schimbat. Dacă specificațiile s-au schimbat, valorile vechi nu sunt copiate, apare avertizare și generarea automată este oprită pentru verificare. Specificații egale nu dovedesc că brokerul/serverul este același: scenariile existente nu au proveniență de server, iar comisionul, convenția pip și terminalul activ trebuie reverificate când schimbi brokerul.
 
 Importul respinge rândurile trunchiate, coloanele cu nume duplicate și timestamp-urile duplicate pentru același simbol, în loc să aleagă arbitrar un close sau să numere de două ori eșantioanele de spread. Când coloana `timeframe` este completată, nu amesteca timeframe-uri diferite pentru același simbol în același fișier. Simboluri diferite pot avea același timestamp. Data/ora trebuie exprimată în timpul local al brokerului, fără `Z` sau offset de fus orar; orele invalide nu sunt înlocuite automat cu miezul nopții.
 
@@ -90,6 +146,49 @@ Un istoric plat poate fi salvat și reîncărcat cu stres zilnic zero și fără
 
 În fila **Robot settings** poți introduce spread minim și slippage în puncte, un comision round-turn comun de fallback și, opțional, un comision per simbol în valuta contului per 1.00 lot. Când este completat, comisionul per simbol înlocuiește fallback-ul pentru acel simbol; când este gol, se folosește fallback-ul comun. Comisionul per simbol poate fi introdus în contractul simbolului sau citit din coloana opțională `commission_per_lot` din CSV-ul de contracte. Exportatorul MT5 nu poate determina comisionul brokerului; verifică și completează-l conform condițiilor contului.
 
+### Reguli prop avansate, marjă și swap
+
+În **Prop firm & account → Advanced prop, margin & swap...**, completează și activează explicit verificările avansate. Ele sunt dezactivate la migrarea scenariilor vechi; raportul semnalează că verdictul simplificat nu verifică marja/swap/regulile avansate. Setările sunt salvate împreună cu portofoliul, în scenariul JSON **versiunea 14**, compatibil la încărcare cu versiunile 1–13.
+
+**Account rules:**
+
+- Capitalul contului din formularul principal este capitalul **inițial**, nu equity-ul curent. Introdu separat equity-ul curent și balance/equity de la resetul zilnic.
+- Alege explicit baza pragului zilnic: equity, balance sau valoarea mai mare dintre ele. Pragul zilnic este baza minus limita zilnică cash (procentul principal este calculat din capitalul inițial).
+- `Static`: prag total = capital inițial minus procentul total din capitalul inițial.
+- `Trailing equity`: prag total = high-water equity minus aceeași distanță cash. Este trailing continuu, **fără plafon**, nu trailing de balance sau numai la închiderea zilei. Introdu high-water real; nu poate fi sub capitalul inițial sau equity-ul curent.
+- Ora resetului este `HH:MM`, cu offset UTC **fix** în minute; `120` înseamnă UTC+02:00. Nu se presupune automat DST/fusul firmei. Data sesiunii este data locală la care a început intervalul după acest reset. După schimbarea sesiunii, baseline-ul vechi blochează recomandările până când introduci noile valori și data corectă.
+- Spațiile zilnic și total rămase sunt calculate separat din equity și praguri. Pentru dimensionarea gridului pe mai multe zile se păstrează intenționat **cel mai mic** spațiu disponibil pe întregul episod; nu se creditează bugete noi la fiecare reset. Sumele „remaining room” introduse în formularul principal pot restrânge suplimentar aceste valori.
+- Introdu limita de pierdere pe idee, marja liberă/folosită și stop-out-ul în **procente de margin level**, nu în modul cash. Equity − marja folosită trebuie să coincidă cu marja liberă, cu toleranță 0,02 în valuta contului.
+
+**Per-robot exposure:**
+
+- Folosește aceeași etichetă `Idea group` pentru roboții/corelațiile care trebuie verificate împreună. Capitalul alocat grupului restrânge bugetul înainte de dimensionare, iar pierderile candidate sunt însumate la verificare. Grupele sunt introduse de utilizator; corelația nu este dedusă din prețuri. Verificarea privește roboții planificați, nu descoperă automat alte idei/poziții ale contului.
+- `Margin / lot` este o limită superioară conservatoare cash pentru 1 lot; se verifică suma la numărul maxim simultan de intrări. Pierderea stresată plus marja gridului nu trebuie să epuizeze marja liberă, iar margin level stresat trebuie să rămână peste stop-out. Marja poate varia cu prețul și treptele de volum; nu se presupun reduceri pentru hedging/netting. Dacă o configurație depășește marja, este respinsă; nu se prezintă ca recomandare sigură.
+- Swap long/short este **debit cash nenegativ în valuta contului / lot / zi de taxare**. Introdu `0` numai dacă este verificat. `Holding days` reprezintă numărul ponderat de zile de taxare, incluzând triple swap/weekend. Rezerva = debit × zile și este adăugată costului **fiecărei intrări încă de la deschidere**, inclusiv în replay; este o estimare conservatoare, nu acumulare calendaristică exactă. Creditele swap nu măresc lotul recomandat. `0` zile înseamnă scenariu fără cost overnight, nu swap gratuit.
+
+Câmpurile obligatorii lipsă produc **UNVERIFIED** sau blochează dimensionarea când costul/bugetul nu poate fi determinat. Depășirile confirmate ale marjei, stop-out-ului ori limitei de grup produc **REJECTED**, inclusiv dacă istoricul este incomplet. Scenariile vechi nu activează automat reguli presupuse.
+
+**Inspect terminal / symbols** citește și equity-ul, marja folosită, modul/pragul de stop-out, estimările `order_calc_margin` BUY/SELL pentru simbolurile portofoliului și swap-urile brute cu modul și ziua triple swap. API-ul doar calculează estimări, nu trimite ordine. Valorile brute swap **nu sunt convertite automat** în cash: pot fi puncte, rate sau altă valută. Verifică unitățile, variația de marjă și condițiile brokerului înainte să introduci limitele normalizate în formular.
+
+În fereastra de stare, selectorul **MT5 symbol for a NEW allocation → Use in Portfolio** completează exact simbolul brokerului în formularul unei alocări noi; alege apoi robotul/procentul și adaugă-l. Nu redenumește alocările existente. Lista brokerului rămâne disponibilă și dacă simbolul introdus anterior nu există sau nu are încă o cotație validă; problemele estimării de marjă sunt afișate separat ca avertizări.
+
+### Verificarea unei curbe de equity MT5 / Strategy Tester
+
+**Evaluate MT5 equity CSV...** verifică o curbă furnizată de utilizator, nu execută robotul și nu transformă lista de tranzacții într-o curbă exactă. Formatul normalizat UTF-8, cu separator virgulă, este:
+
+```csv
+timestamp,balance,equity
+2026-10-19T00:00:00+02:00,25000,25000
+2026-10-19T12:00:00+02:00,25000,24600
+2026-10-20T00:00:00+02:00,24600,24600
+```
+
+Exportă/loghează aceste valori din testul MT5 ori monitorizarea contului sau normalizează un export care conține efectiv equity. Rapoartele HTML native și listele de deals nu sunt parsate universal. Sunt necesare cel puțin două eșantioane unice, cronologice, cu fus explicit. Limita fișierului este 10 MiB. Confirmă contul/valuta, capitalul inițial și absența depunerilor/retragerilor; pentru trailing, high-water introdus este cel **de la începutul curbei**.
+
+Evaluatorul aplică separat pragul zilnic la resetul configurat și pragul total static/trailing. Lipsa unui eșantion exact la reset sau a unor sesiuni produce **UNVERIFIED**; nu este inventat un baseline verificat din primul eșantion întârziat. O încălcare totală observată rămâne raportată. Egalitatea cu un prag este tratată conservator ca încălcare. Rezultatul este **BREACHED**, **UNVERIFIED** sau **NO SAMPLED BREACH**; ultima etichetă nu înseamnă acceptare prop și nu dovedește că nu au existat pierderi între eșantioane.
+
+Curba, regulile folosite și raportul sunt salvate atomic în `data\equity_validation.json`. **Open saved equity report** îl redeschide offline, etichetat ca snapshot nerecalculat pentru setările de azi. Rezultatul nu aprobă setările candidate ale plannerului, deoarece curba poate proveni din alt preset. Validarea reală necesită rularea EA-ului cu presetul exact în Strategy Tester/demo și colectarea datelor aferente.
+
 Spread-ul din setări este pragul de bază pentru toate alocările. Dacă istoricul MT5 importat are `spread_max_points`, plannerul prioritizează această valoare, agregă maximul zilnic pe simbol și folosește valoarea mai mare dintre spread-ul observat și pragul introdus. Fișierele vechi rămân compatibile prin coloana `spread`. Pentru drawdown peak-to-trough folosește maximul observat în întregul istoric. Spread-ul Yahoo nu este disponibil; fără coloana MT5 rămâne valoarea introdusă manual.
 
 Replay-ul zilnic validează costurile configurate înainte de aplicarea spread-ului istoric: spread-ul, slippage-ul și comisionul trebuie să fie finite și nenegative. Un spread istoric valid nu corectează implicit un spread configurat negativ sau nevalid; apelurile directe ale motorului primesc o eroare explicită.
@@ -106,7 +205,7 @@ După **Generate candidate settings**, dacă există bare zilnice MT5 și un Tak
 
 Simularea presupune intrări market la atingerea nivelului, nu ordine pending: dacă un gap advers trece de următoarea intrare, aceasta se execută la open, iar următorul nivel este recalculat de la prețul efectiv de intrare. Nu sunt inventate execuții la niveluri sărite de gap. Un gap favorabil care deschide dincolo de TP închide coșul la open, înainte de mișcările ulterioare ale zilei. Spread-ul, slippage-ul și comisionul rămân costuri cash aproximative, nu cotații Bid/Ask simulate.
 
-Această simulare folosește traseul OHLC zilnic presupus „open, mișcarea adversă, cea favorabilă, close” (pentru long: open–low–high–close; pentru short: open–high–low–close). CSV-urile/scenariile vechi fără open rămân compatibile: se folosește close-ul precedent limitat la intervalul low–high al barei, iar raportul avertizează că execuția la gap este aproximată. Reimportă istoricul MT5 pentru a păstra open-ul real. Scenariile noi se salvează în versiunea 13, cu open opțional; încărcarea versiunilor 1–12 rămâne disponibilă.
+Această simulare folosește traseul OHLC zilnic presupus „open, mișcarea adversă, cea favorabilă, close” (pentru long: open–low–high–close; pentru short: open–high–low–close). CSV-urile/scenariile vechi fără open rămân compatibile: se folosește close-ul precedent limitat la intervalul low–high al barei, iar raportul avertizează că execuția la gap este aproximată. Reimportă istoricul MT5 pentru a păstra open-ul real. Scenariile noi se salvează în versiunea 14, păstrând open-ul opțional introdus în versiunea 13; încărcarea versiunilor 1–13 rămâne disponibilă.
 
 Drawdown-ul maxim în bani păstrează vârful și minimul episodului respectiv; o recuperare ulterioară nu schimbă aceste date. Drawdown-ul procentual maxim este urmărit separat, fiecare scădere fiind raportată la vârful equity existent atunci, nu la un maxim ulterior. Cele două maxime pot proveni din episoade diferite. Pierderea zilnică folosește equity-ul de la închiderea barei precedente ca bază și include gap-ul și costurile intrărilor; nu implementează ora de reset sau regulile specifice unei firme prop.
 
@@ -114,7 +213,7 @@ Stresul static include și intrarea care se deschide exact la capătul mișcări
 
 Calculul stresului static acumulează pierderile într-o singură parcurgere a intrărilor atinse, fără recalcularea fiecărui prefix al gridului. Aceasta reduce timpul pentru griduri mari fără schimbarea formulei, costurilor sau regulii de 80%. Numărul maxim de tranzacții încadrate în buget reprezintă capacitatea configurabilă în scenariul testat, nu numărul de poziții efectiv deschise: intrările dincolo de mișcarea testată nu adaugă pierdere.
 
-Barele intraday sunt în prezent agregate pe zi înainte de simulare; deci nu este încă replay M1/M5 și nu poate stabili ordinea reală a mișcărilor în interiorul zilei. După atingerea TP, campania rămâne inactivă pentru restul istoricului; nu sunt generate cicluri noi, deoarece semnalele și condițiile reale ale EA-ului sunt necunoscute. Rezultatul nu modelează marja, swap-ul, execuția reală sau semnalele RSI și nu este echivalent cu Strategy Tester.
+Barele intraday sunt în prezent agregate pe zi înainte de simulare; deci nu este încă replay M1/M5 și nu poate stabili ordinea reală a mișcărilor în interiorul zilei. După atingerea TP, campania rămâne inactivă pentru restul istoricului; nu sunt generate cicluri noi, deoarece semnalele și condițiile reale ale EA-ului sunt necunoscute. Replay-ul nu modelează lichidarea dinamică pe marjă sau acumularea calendaristică exactă a swap-ului; verificările avansate adaugă separat filtrul de marjă la expunere maximă și rezerva swap preplătită descrise mai sus. Nu reproduce execuția reală sau semnalele RSI și nu este echivalent cu Strategy Tester.
 
 Nici simularea, nici modurile de stres nu reproduc complet EA-ul: plannerul nu cunoaște regulile efective de intrare RSI, pozițiile deja deschise, spread-ul din fiecare tick, swap-ul, execuția, gap-urile viitoare sau dacă EA-ul respectă setările recomandate. Pentru RSI, riscul este aproximat ca un grid de poziții la distanțele și multiplicatorul introduse, nu ca o simulare a semnalelor RSI. Fără sursele EA-urilor nu se poate confirma compatibilitatea parametrilor `.set` sau preveni redeschiderea pozițiilor de către robot. Validează scenariile în Strategy Tester și pe demo înainte de folosire.
 
