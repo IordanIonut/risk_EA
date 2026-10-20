@@ -1305,7 +1305,7 @@ def run_stress_check(
     )
     if "rsi" in allocation.allocation.robot.lower():
         print(
-            "RSI-only backtest starting reference (not a safety guarantee): "
+            "RSI-only backTest starting reference (not a safety guarantee): "
             "Period 14, Oversold 30, Overbought 70. These signal settings do "
             "not cap losses."
         )

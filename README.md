@@ -5,7 +5,11 @@ Aplicație desktop pentru estimarea bugetelor de risc și dimensionarea unor set
 ## Pornire și verificare
 
 - Deschide `risk_calculator_app.pyw` cu Python pe Windows sau rulează `pyw risk_calculator_app.pyw`.
-- Aplicația folosește biblioteca standard Python; nu are nevoie de pachete Python externe.
+- Modul standard și importurile CSV folosesc biblioteca standard Python. Conectarea directă la MT5 este opțională și cere pachetul `MetaTrader5`.
+- Portofoliul, contractele introduse și istoricul Yahoo/MT5/API se salvează automat în `data\portfolio.json` lângă aplicație și se reîncarcă la următoarea pornire. Folderul `data\` este ignorat de Git deoarece fișierul poate conține informații private ale contului. Datele autosalvate anterior în `%APPDATA%\MT5RiskPlanner\portfolio.json` sunt migrate automat prima dată. Scenariile salvate manual rămân disponibile separat.
+- La deschidere, după încărcarea portofoliului, aplicația reîmprospătează datele în fundal: Yahoo pentru alocările Yahoo/fără sursă, terminalul pentru sursa **MT5 terminal**, respectiv endpointul salvat pentru **Broker API** (și pentru alocări fără sursă când este configurat un endpoint). Indicatorul animat din bara de stare rămâne vizibil pe durata operației, inclusiv la descărcările manuale. Istoricul CSV nu este înlocuit automat cu Yahoo; se păstrează cu o avertizare pentru reimport/conectare MT5. Dacă o sursă nu răspunde, datele salvate sunt păstrate, celelalte alocări continuă actualizarea și la final apare o avertizare. Tokenurile API nu se salvează: dacă endpointul cere autentificare, introdu tokenul și apasă **Fetch broker data**. Actualizarea la pornire nu schimbă valuta contului și nu generează automat setări EA.
+- Opțional, **Connect MT5: get specs + 5y D1** citește direct contractele și barele D1 din terminalul MT5 instalat și autentificat. Această funcție cere pachetul oficial Python `MetaTrader5` în același interpreter (`py -m pip install MetaTrader5`); alternativ, completarea manuală și importurile CSV rămân disponibile.
+- Opțional, **Broker REST API** poate prelua prețul, contractul și barele zilnice printr-un endpoint HTTPS configurabil. API-urile brokerilor nu au o schemă universală: endpointul trebuie să furnizeze JSON-ul normalizat de mai jos. Template-ul URL acceptă `{symbol}`, `{start}`, `{end}` și `{interval}` (`1d`, interval de cinci ani); tokenul Bearer rămâne doar în memorie și nu este salvat. Doar endpointul fără credențiale se salvează în `data\broker_api_config.json`.
 - Teste: `py -m unittest -v`.
 - Calculatorul în terminal rămâne disponibil prin `py risk_calculator.py`.
 
@@ -21,17 +25,48 @@ Poți avea mai multe instanțe cu același simbol, robot și ticker. Selectorul 
 
 Scenariile păstrează selecția după poziția alocării în listă, inclusiv pentru instanțe cu nume identice. Identificatorii afișați sunt locali aplicației și se pot schimba după reîncărcare; nu sunt Magic Numbers și nu sunt exportați ca parametri EA. Step, Take Profit și celelalte setări comune ale formularului nu devin preseturi independente per instanță.
 
+Fiecare robot nou se adaugă prin procent din capitalul contului. Capitalul alocat este recalculat din procent când se schimbă capitalul contului; procentele alocărilor noi nu pot depăși împreună 100%. Scenariile mai vechi cu alocări introduse în bani rămân compatibile și își păstrează sumele. Raportul împarte limita efectivă proporțional cu capitalul alocat fiecărui robot.
+
+La recomandarea agregată, verdictul este **ACCEPTED** numai când pierderea modelată rămâne în maximum 80% din bugetul alocat și este completată limita totală prop rămasă; peste pragul de 80% apare **NOT ACCEPTED**, iar depășirea bugetului apare **REJECTED**. Lipsa datelor pentru o alocare sau a limitei totale prop face verdictul **UNVERIFIED**. Pentru portofoliile acceptate, raportul include un bloc de setări candidate per alocare (Magic Number, `Max Trades`, lot fix și valorile Step/Take Profit partajate). Setările de strategie rămân cele introduse de utilizator și nu sunt deduse pentru fiecare EA. Acesta este un filtru al modelului istoric configurat, nu aprobarea firmei prop și nici o garanție de risc live. Plannerul calculează lotul și `Max Trades`; păstrează valorile strategice Step, Take Profit și RSI introduse de utilizator, nu le optimizează.
+
 ## Date de contract și istoric MT5
 
-1. În MT5 compilează și rulează `ExportMT5ContractSpecs.mq5` pentru specificațiile din Market Watch, inclusiv volumul maxim per ordin. Importă CSV-ul rezultat cu **Import MT5 contract CSV**.
+1. Contractul brokerului (valoarea punctului, point size, volum minim/pas/maxim și valuta valorii punctului) se poate citi automat cu **Connect MT5: get specs + 5y D1**, dacă terminalul este instalat, autentificat și disponibil prin pachetul Python `MetaTrader5`. Alternativ, completează câmpurile în fila Robot settings sau importă contractul cu **Import MT5 contract CSV**. Yahoo nu poate furniza aceste valori specifice CFD-ului.
 2. Pentru istoric, compilează `ExportMT5History.mq5`, alege simbolul, timeframe-ul (recomandat `PERIOD_D1`) și numărul de bare, apoi rulează scriptul. Importă fișierul prin **Import MT5 OHLC history CSV**. Exportul include data/ora barei, OHLC, volume, spread-ul barei și, implicit, maximul/media spread-ului observat în update-uri Bid/Ask și numărul eșantioanelor valide.
 3. Exportatoarele scriu în Common Files din MT5. În fișierul de istoric se păstrează simbolul brokerului; importul acceptă și mai multe simboluri în același CSV.
 4. Se cer cel puțin 20 de bare zilnice valide. Barele intraday sunt agregate pe zi (open din prima bară cronologică, high maxim, low minim și ultimul close), inclusiv când rândurile CSV nu sunt ordonate. Open, când există, și close trebuie să fie în intervalul low–high al fiecărei bare, înainte de agregare.
-5. **Suggest all robots (historical drawdown)** folosește OHLC MT5 pentru alocările care au istoric importat și cere Yahoo numai pentru alocările incomplete. Recomandarea folosește cea mai mare cădere istorică de la un maxim la un minim ulterior. **Fetch Yahoo data for all** înlocuiește explicit istoricul local cu datele Yahoo acolo unde Yahoo returnează istoric.
+5. **Suggest all robots (historical drawdown)** reîmprospătează automat istoricul zilnic Yahoo pe ultimii 5 ani pentru alocările care nu au istoric MT5 și păstrează istoricul MT5 importat. Nu este necesar un fișier Excel/CSV pentru istoricul de piață; cotația și barele sunt memorate în JSON-ul local, folosite la pornirea următoare și reîmprospătate la următoarea recomandare agregată. Dacă reîmprospătarea online eșuează, un snapshot Yahoo salvat anterior poate fi folosit cu avertizare în raport. Datele Yahoo pot diferi de CFD-ul brokerului. **Fetch Yahoo data for all** înlocuiește explicit istoricul local cu date Yahoo acolo unde acestea sunt disponibile.
 
 Importul respinge rândurile trunchiate, coloanele cu nume duplicate și timestamp-urile duplicate pentru același simbol, în loc să aleagă arbitrar un close sau să numere de două ori eșantioanele de spread. Când coloana `timeframe` este completată, nu amesteca timeframe-uri diferite pentru același simbol în același fișier. Simboluri diferite pot avea același timestamp. Data/ora trebuie exprimată în timpul local al brokerului, fără `Z` sau offset de fus orar; orele invalide nu sunt înlocuite automat cu miezul nopții.
 
 Prețurile Yahoo sunt doar fallback/referință și pot diferi de CFD-ul brokerului. Valoarea punctului, valuta contului, volumul minim și pasul de lot trebuie să corespundă exact contractului MT5. Istoricul MT5 este mai apropiat de instrumentul tranzacționat, dar tot nu prezice prețul sau execuția viitoare.
+
+### API REST broker
+
+Aplicația nu se poate conecta automat la orice broker fără adaptor, deoarece endpointurile, autentificarea și formatele diferă. Pentru interfața REST generică, configurează un URL HTTPS cu `{symbol}` (opțional `{start}`, `{end}`, `{interval}`) și un token Bearer dacă API-ul îl cere. Un răspuns per simbol trebuie să respecte această structură:
+
+```json
+{
+  "account_currency": "USD",
+  "symbol": "US500",
+  "quote": {"price": "5000.25", "currency": "USD", "time": "2026-10-20T10:00:00Z"},
+  "contract": {
+    "point_size": "0.1",
+    "point_value_per_point_per_lot": "1.25",
+    "points_per_ea_pip": "10",
+    "lot_step": "0.01",
+    "min_lot": "0.01",
+    "max_lot": "100",
+    "commission_per_lot": "2.5",
+    "contract_currency": "USD"
+  },
+  "bars": [
+    {"date": "2026-10-19", "open": "4998", "high": "5010", "low": "4990", "close": "5001", "spread_points": "3", "spread_sample_count": 100}
+  ]
+}
+```
+
+`bars` trebuie să conțină cel puțin 20 de bare zilnice valide, cu date unice, în format `YYYY-MM-DD`; se verifică OHLC, valoarea contractului și potrivirea simbolului/valutei. `contract_currency` trebuie să fie aceeași cu `account_currency`, pentru ca valoarea punctului să fie interpretată corect. Fiecare alocare primește o cerere pentru simbolul ei, iar răspunsurile actualizează cotația, contractul și istoricul brokerului, apoi pornesc estimarea agregată. Datele și tokenul sunt transmise brokerului configurat; folosește doar API-ul oficial al brokerului și verifică permisiunile, unitățile contractului și condițiile de utilizare. URL-ul și tokenul nu trebuie să includă secrete stocate în clar; tokenul se introduce doar în câmpul mascat. Integrarea generică nu implică verificare sau suport oficial pentru un broker anume.
 
 La importul contractelor, `profit_currency` nu identifică valuta valorii punctului: valuta profitului instrumentului poate diferi de valuta contului în care brokerul raportează valoarea tick-ului. Folosește `account_currency`, `point_value_currency`, `account_currency_for_point_value` sau `contract_currency` pentru valuta valorii punctului. Un CSV vechi care conține numai `profit_currency` lasă acest câmp necompletat; completează coloana corectă și reimportă înainte de a genera recomandări.
 

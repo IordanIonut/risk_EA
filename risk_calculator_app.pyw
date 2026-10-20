@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+import importlib
 import io
 import json
 import os
 import queue
 import re
+from string import Formatter
 import tempfile
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 from urllib.request import Request, urlopen
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -167,6 +169,18 @@ YAHOO_ALIASES = {
     "JP225INDEX": "^N225",
 }
 
+APP_DATA_DIRECTORY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+)
+AUTOSAVE_FILE_NAME = "portfolio.json"
+BROKER_API_CONFIG_FILE_NAME = "broker_api_config.json"
+LEGACY_AUTOSAVE_PATH = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "MT5RiskPlanner",
+    AUTOSAVE_FILE_NAME,
+)
+
 QuoteData = tuple[Decimal, str, str, str]
 ContractFields = dict[str, str]
 HISTORICAL_STRESS_MODE = "Historical max daily range (MT5 / Yahoo fallback)"
@@ -175,6 +189,8 @@ HISTORICAL_STRESS_MODES = (
     HISTORICAL_STRESS_MODE,
     HISTORICAL_DRAWDOWN_MODE,
 )
+MT5_HISTORY_SOURCES = ("MT5 CSV", "MT5 terminal")
+BROKER_HISTORY_SOURCES = (*MT5_HISTORY_SOURCES, "Broker API")
 LEGACY_HISTORICAL_STRESS_MODE = "Yahoo 5-year max daily range"
 
 
@@ -226,6 +242,456 @@ class YahooDataResult:
     quote: QuoteData | None
     history: HistoricalStress | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class MT5SymbolData:
+    contract: ContractFields
+    bars: tuple[DailyBar, ...]
+    quote: QuoteData
+
+
+@dataclass(frozen=True)
+class MT5PortfolioResult:
+    rows: dict[str, MT5SymbolData]
+    account_currency: str
+    error: str | None = None
+
+
+def fetch_mt5_terminal_data(
+    symbols: list[str],
+    history_years: int = 5,
+    mt5_module: object | None = None,
+) -> tuple[str, dict[str, MT5SymbolData]]:
+    if (
+        isinstance(history_years, bool)
+        or not isinstance(history_years, int)
+        or history_years <= 0
+    ):
+        raise ValueError("MT5 history years must be a positive integer.")
+    if mt5_module is None:
+        try:
+            mt5_module = importlib.import_module("MetaTrader5")
+        except ImportError as error:
+            raise ValueError(
+                "The MetaTrader5 Python package is not installed. Install it in "
+                "the same Python environment with `py -m pip install MetaTrader5`, "
+                "then open and log in to the MT5 terminal."
+            ) from error
+
+    mt5 = mt5_module
+    terminal_was_initialized = getattr(mt5, "terminal_info")() is not None
+    if not terminal_was_initialized and not getattr(mt5, "initialize")():
+        raise ValueError(
+            f"Could not connect to the MT5 terminal: {getattr(mt5, 'last_error')()}."
+        )
+
+    try:
+        account = getattr(mt5, "account_info")()
+        account_currency = str(getattr(account, "currency", "") or "").strip().upper()
+        if account is None or not account_currency:
+            raise ValueError(
+                "MT5 account information is unavailable or has no account currency. "
+                "Log in to the broker account in the terminal."
+            )
+
+        now = datetime.now(timezone.utc)
+        try:
+            start = now.replace(year=now.year - history_years)
+        except ValueError:
+            start = now.replace(year=now.year - history_years, day=28)
+        timeframe = getattr(mt5, "TIMEFRAME_D1")
+        result: dict[str, MT5SymbolData] = {}
+        for symbol in dict.fromkeys(item.strip() for item in symbols if item.strip()):
+            if not getattr(mt5, "symbol_select")(symbol, True):
+                raise ValueError(
+                    f"MT5 could not select symbol '{symbol}' in Market Watch."
+                )
+            info = getattr(mt5, "symbol_info")(symbol)
+            if info is None:
+                raise ValueError(f"MT5 has no contract information for '{symbol}'.")
+
+            point = Decimal(str(getattr(info, "point", "0")))
+            tick_size = Decimal(str(getattr(info, "trade_tick_size", "0")))
+            tick_value = Decimal(
+                str(
+                    getattr(info, "trade_tick_value_profit", 0)
+                    or getattr(info, "trade_tick_value", 0)
+                )
+            )
+            volume_step = Decimal(str(getattr(info, "volume_step", "0")))
+            volume_min = Decimal(str(getattr(info, "volume_min", "0")))
+            if (
+                not point.is_finite()
+                or not tick_size.is_finite()
+                or not tick_value.is_finite()
+                or point <= ZERO
+                or tick_size <= ZERO
+                or tick_value <= ZERO
+                or volume_step <= ZERO
+                or volume_min <= ZERO
+            ):
+                raise ValueError(
+                    f"MT5 returned incomplete or invalid point/tick/volume data "
+                    f"for '{symbol}'."
+                )
+            point_value = tick_value * point / tick_size
+            volume_max = Decimal(str(getattr(info, "volume_max", "0")))
+            contract: ContractFields = {
+                "point_value": str(point_value),
+                "point_size": str(point),
+                "points_per_pip": "",
+                "lot_increment": str(volume_step),
+                "minimum_lot": str(volume_min),
+                "maximum_lot": str(volume_max) if volume_max > ZERO else "",
+                "commission_per_lot": "",
+                "contract_currency": account_currency,
+            }
+
+            rates = getattr(mt5, "copy_rates_range")(
+                symbol, timeframe, start, now
+            )
+            if rates is None or len(rates) < 20:
+                last_error = getattr(mt5, "last_error")()
+                raise ValueError(
+                    f"MT5 returned fewer than 20 daily bars for '{symbol}' "
+                    f"over the last {history_years} years ({last_error})."
+                )
+            bars: list[DailyBar] = []
+            for rate in rates:
+                try:
+                    timestamp = int(rate["time"])
+                    bar_date = datetime.fromtimestamp(
+                        timestamp, timezone.utc
+                    ).date().isoformat()
+                    bar = DailyBar(
+                        date=bar_date,
+                        open=Decimal(str(rate["open"])),
+                        high=Decimal(str(rate["high"])),
+                        low=Decimal(str(rate["low"])),
+                        close=Decimal(str(rate["close"])),
+                        spread_points=(
+                            Decimal(str(rate["spread"]))
+                            if "spread"
+                            in getattr(getattr(rate, "dtype", None), "names", ())
+                            else None
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError) as error:
+                    raise ValueError(
+                        f"MT5 returned a malformed daily bar for '{symbol}'."
+                    ) from error
+                bars.append(bar)
+            bars_tuple = tuple(bars)
+            calculate_historical_stress(bars_tuple)
+
+            tick = getattr(mt5, "symbol_info_tick")(symbol)
+            ask = Decimal(str(getattr(tick, "ask", "0") or "0"))
+            bid = Decimal(str(getattr(tick, "bid", "0") or "0"))
+            if ask.is_finite() and ask > ZERO:
+                market_price = ask
+            elif bid.is_finite() and bid > ZERO:
+                market_price = bid
+            else:
+                market_price = bars_tuple[-1].close
+            tick_time = getattr(tick, "time", None)
+            quote_time = (
+                datetime.fromtimestamp(int(tick_time), timezone.utc)
+                .astimezone()
+                .strftime("%Y-%m-%d %H:%M")
+                if tick_time
+                else f"{bars_tuple[-1].date} (last MT5 D1 close)"
+            )
+            result[symbol.strip().upper()] = MT5SymbolData(
+                contract=contract,
+                bars=bars_tuple,
+                quote=(
+                    market_price,
+                    str(getattr(info, "currency_profit", "") or account_currency),
+                    symbol,
+                    quote_time,
+                ),
+            )
+        if not result:
+            raise ValueError("No MT5 broker symbols were selected for data fetch.")
+        return account_currency, result
+    finally:
+        if not terminal_was_initialized:
+            getattr(mt5, "shutdown")()
+
+
+def fetch_broker_api_data(
+    endpoint_template: str,
+    api_token: str,
+    symbols: list[str],
+    timeout: int = 30,
+) -> tuple[str, dict[str, MT5SymbolData]]:
+    validate_broker_api_endpoint(endpoint_template)
+    if not symbols:
+        raise ValueError("Select at least one broker symbol for the API request.")
+
+    now = datetime.now(timezone.utc)
+    try:
+        history_start = now.replace(year=now.year - 5)
+    except ValueError:
+        history_start = now.replace(year=now.year - 5, day=28)
+    placeholders = {
+        "symbol": "",
+        "start": history_start.date().isoformat(),
+        "end": now.date().isoformat(),
+        "interval": "1d",
+    }
+    account_currency = ""
+    results: dict[str, MT5SymbolData] = {}
+    for requested_symbol in symbols:
+        symbol = requested_symbol.strip()
+        if not symbol:
+            raise ValueError("Broker API symbol names cannot be blank.")
+        request_url = endpoint_template.strip().format(
+            symbol=quote(symbol, safe=""),
+            start=placeholders["start"],
+            end=placeholders["end"],
+            interval=placeholders["interval"],
+        )
+        headers = {"Accept": "application/json"}
+        if api_token.strip():
+            headers["Authorization"] = f"Bearer {api_token.strip()}"
+        request = Request(request_url, headers=headers)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                response_body = response.read(50 * 1024 * 1024 + 1)
+            if len(response_body) > 50 * 1024 * 1024:
+                raise ValueError("Broker API response exceeds the 50 MiB limit.")
+            payload = json.loads(response_body.decode("utf-8"))
+            symbol_data = _parse_broker_api_symbol_data(payload, symbol)
+        except HTTPError as error:
+            raise ValueError(
+                f"Broker API returned HTTP {error.code} for {symbol}."
+            ) from error
+        except (URLError, OSError, TimeoutError) as error:
+            raise ValueError(f"Broker API request failed for {symbol}: {error}") from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Broker API returned invalid UTF-8 or JSON for {symbol}."
+            ) from error
+        except (KeyError, TypeError, InvalidOperation, OverflowError) as error:
+            raise ValueError(
+                f"Broker API response is invalid for {symbol}: {error}"
+            ) from error
+        response_currency = symbol_data.contract["contract_currency"]
+        if not account_currency:
+            account_currency = response_currency
+        elif response_currency != account_currency:
+            raise ValueError(
+                "Broker API responses returned inconsistent account currencies."
+            )
+        results[symbol.upper()] = symbol_data
+    return account_currency, results
+
+
+def validate_broker_api_endpoint(endpoint_template: str) -> None:
+    endpoint = endpoint_template.strip()
+    try:
+        parsed_endpoint = urlsplit(endpoint)
+        parsed_fields = tuple(Formatter().parse(endpoint))
+    except ValueError as error:
+        raise ValueError(f"Broker API endpoint is malformed: {error}") from error
+    if parsed_endpoint.scheme.lower() != "https" or not parsed_endpoint.hostname:
+        raise ValueError("Broker API endpoint must be an HTTPS URL.")
+    if parsed_endpoint.username or parsed_endpoint.password or parsed_endpoint.fragment:
+        raise ValueError(
+            "Do not put credentials or secret fragments in the endpoint URL."
+        )
+    fields = {field_name for _literal, field_name, _spec, _conversion in parsed_fields}
+    if "symbol" not in fields:
+        raise ValueError("Broker API endpoint must include the {symbol} placeholder.")
+    if fields - {"symbol", "start", "end", "interval"} or any(
+        spec or conversion
+        for _literal, field_name, spec, conversion in parsed_fields
+        if field_name is not None
+    ):
+        raise ValueError(
+            "Endpoint placeholders may only be {symbol}, {start}, {end}, and {interval}."
+        )
+    sensitive_query_keys = {
+        "key",
+        "apikey",
+        "accesstoken",
+        "auth",
+        "password",
+        "secret",
+        "clientsecret",
+        "signature",
+        "xapikey",
+        "token",
+    }
+    query_keys = (
+        re.sub(r"[^a-z0-9]", "", key.lower())
+        for key, _value in parse_qsl(parsed_endpoint.query, keep_blank_values=True)
+    )
+    if any(key in sensitive_query_keys for key in query_keys):
+        raise ValueError(
+            "Do not put API credentials in the endpoint URL; use the token field."
+        )
+
+
+def _parse_broker_api_symbol_data(payload: object, requested_symbol: str) -> MT5SymbolData:
+    if not isinstance(payload, dict):
+        raise ValueError("response root must be a JSON object")
+    actual_symbol = payload.get("symbol")
+    if not isinstance(actual_symbol, str) or actual_symbol.strip().upper() != requested_symbol.upper():
+        raise ValueError("response symbol does not match the requested broker symbol")
+    account_currency = payload.get("account_currency")
+    quote_data = payload.get("quote")
+    contract_data = payload.get("contract")
+    bars_data = payload.get("bars")
+    if not isinstance(account_currency, str) or not account_currency.strip():
+        raise ValueError("account_currency must be a non-empty string")
+    if not isinstance(quote_data, dict) or not isinstance(contract_data, dict):
+        raise ValueError("quote and contract must be JSON objects")
+    if not isinstance(bars_data, list):
+        raise ValueError("bars must be a JSON array")
+
+    def decimal_field(value: object, label: str, *, positive: bool = False) -> Decimal:
+        if isinstance(value, bool) or value is None:
+            raise ValueError(f"{label} must be a finite number")
+        try:
+            result = Decimal(str(value))
+        except InvalidOperation as error:
+            raise ValueError(f"{label} must be a finite number") from error
+        if not result.is_finite() or (positive and result <= ZERO):
+            qualifier = "positive and finite" if positive else "finite"
+            raise ValueError(f"{label} must be {qualifier}")
+        return result
+
+    def contract_field(
+        primary: str,
+        alternate: str | None = None,
+        *,
+        positive: bool = False,
+        optional: bool = False,
+    ) -> str:
+        raw = contract_data.get(primary)
+        if raw is None and alternate:
+            raw = contract_data.get(alternate)
+        if raw is None and optional:
+            return ""
+        return format(decimal_field(raw, f"contract.{primary}", positive=positive), "f")
+
+    contract_currency = contract_data.get("contract_currency", account_currency)
+    if not isinstance(contract_currency, str) or not contract_currency.strip():
+        raise ValueError("contract.contract_currency must be a non-empty string")
+    if contract_currency.strip().upper() != account_currency.strip().upper():
+        raise ValueError(
+            "contract currency must match account_currency for point-value sizing"
+        )
+    contract: ContractFields = {
+        "point_size": contract_field("point_size", positive=True),
+        "point_value": contract_field(
+            "point_value_per_point_per_lot", "point_value", positive=True
+        ),
+        "points_per_pip": contract_field(
+            "points_per_ea_pip",
+            "points_per_pip",
+            positive=True,
+            optional=True,
+        ),
+        "lot_increment": contract_field("lot_step", "lot_increment", positive=True),
+        "minimum_lot": contract_field("min_lot", "minimum_lot", positive=True),
+        "maximum_lot": contract_field(
+            "max_lot", "maximum_lot", positive=True, optional=True
+        ),
+        "commission_per_lot": contract_field(
+            "commission_per_lot", optional=True
+        ),
+        "contract_currency": contract_currency.strip().upper(),
+    }
+    if contract["commission_per_lot"]:
+        commission = Decimal(contract["commission_per_lot"])
+        if commission < ZERO:
+            raise ValueError("contract.commission_per_lot cannot be negative")
+
+    quote_price = decimal_field(quote_data.get("price"), "quote.price", positive=True)
+    quote_currency = quote_data.get("currency", account_currency)
+    quote_time = quote_data.get("time", "time unavailable")
+    if not isinstance(quote_currency, str) or not quote_currency.strip():
+        raise ValueError("quote.currency must be a non-empty string")
+    if not isinstance(quote_time, str):
+        raise ValueError("quote.time must be a string")
+    quote: QuoteData = (
+        quote_price,
+        quote_currency.strip().upper(),
+        requested_symbol,
+        quote_time.strip() or "time unavailable",
+    )
+
+    bars: list[DailyBar] = []
+    for index, item in enumerate(bars_data, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"bars[{index - 1}] must be a JSON object")
+        bar_date = item.get("date")
+        if not isinstance(bar_date, str):
+            raise ValueError(f"bars[{index - 1}].date must be YYYY-MM-DD text")
+        try:
+            normalized_date = datetime.strptime(bar_date, "%Y-%m-%d").date().isoformat()
+        except ValueError as error:
+            raise ValueError(
+                f"bars[{index - 1}].date must be a valid YYYY-MM-DD date"
+            ) from error
+        low = decimal_field(item.get("low"), f"bars[{index - 1}].low", positive=True)
+        high = decimal_field(item.get("high"), f"bars[{index - 1}].high", positive=True)
+        close = decimal_field(item.get("close"), f"bars[{index - 1}].close", positive=True)
+        raw_open = item.get("open")
+        raw_spread = item.get("spread_points")
+        raw_samples = item.get("spread_sample_count")
+        if raw_samples is not None and (
+            isinstance(raw_samples, bool)
+            or not isinstance(raw_samples, int)
+        ):
+            raise ValueError(
+                f"bars[{index - 1}].spread_sample_count must be a non-negative integer"
+            )
+        bar = DailyBar(
+            normalized_date,
+            high,
+            low,
+            close,
+            spread_points=(
+                decimal_field(raw_spread, f"bars[{index - 1}].spread_points")
+                if raw_spread is not None
+                else None
+            ),
+            open=(
+                decimal_field(raw_open, f"bars[{index - 1}].open", positive=True)
+                if raw_open is not None
+                else None
+            ),
+            spread_sample_count=(
+                int(raw_samples)
+                if isinstance(raw_samples, int) and not isinstance(raw_samples, bool)
+                else None
+            ),
+        )
+        if bar.low > bar.high or not bar.low <= bar.close <= bar.high:
+            raise ValueError(
+                f"bars[{index - 1}] has inconsistent OHLC prices"
+            )
+        if bar.open is not None and not bar.low <= bar.open <= bar.high:
+            raise ValueError(f"bars[{index - 1}].open is outside low/high")
+        if bar.spread_points is not None and bar.spread_points < ZERO:
+            raise ValueError(f"bars[{index - 1}].spread_points cannot be negative")
+        if bar.spread_sample_count is not None and bar.spread_sample_count < 0:
+            raise ValueError(
+                f"bars[{index - 1}].spread_sample_count cannot be negative"
+            )
+        bars.append(bar)
+    if len(bars) < 20:
+        raise ValueError("at least 20 valid daily bars are required")
+    if len({bar.date for bar in bars}) != len(bars):
+        raise ValueError("daily bars cannot contain duplicate dates")
+    bars.sort(key=lambda bar: bar.date)
+    calculate_historical_stress(tuple(bars))
+    return MT5SymbolData(contract, tuple(bars), quote)
 
 
 def decimal_value(value: str, label: str) -> Decimal:
@@ -767,6 +1233,9 @@ def build_mt5_set_template(robot: str, settings: dict[str, str]) -> str:
 
 
 class RiskCalculatorApp(tk.Tk):
+    AUTOSAVE_ENABLED = True
+    STARTUP_REFRESH_ENABLED = True
+
     def __init__(self) -> None:
         super().__init__()
         self.title("MT5 Portfolio Risk Planner")
@@ -774,6 +1243,7 @@ class RiskCalculatorApp(tk.Tk):
         self.minsize(980, 700)
 
         self.allocations: dict[str, Allocation] = {}
+        self.allocation_percentages: dict[str, Decimal | None] = {}
         self.next_allocation_id = 1
         self.allocation_results: dict[str, AllocationResult] = {}
         self.contract_inputs: dict[str, ContractFields] = {}
@@ -785,7 +1255,10 @@ class RiskCalculatorApp(tk.Tk):
         self.quote_messages: queue.Queue[tuple[str, str, object]] = queue.Queue()
         self.quote_busy = False
         self.quote_request_cancelled = False
+        self._startup_refresh_after_id: str | None = None
         self.fetch_all_button: ttk.Button | None = None
+        self.fetch_mt5_button: ttk.Button | None = None
+        self.fetch_broker_api_button: ttk.Button | None = None
         self.batch_total = 0
         self.batch_completed = 0
         self.batch_errors: list[str] = []
@@ -798,10 +1271,30 @@ class RiskCalculatorApp(tk.Tk):
         self.auto_stress_target_price: str | None = None
         self.generated_scenario: dict[str, object] | None = None
         self.generated_output = ""
+        self.autosave_path = os.path.join(APP_DATA_DIRECTORY, AUTOSAVE_FILE_NAME)
+        self.broker_api_config_path = os.path.join(
+            APP_DATA_DIRECTORY, BROKER_API_CONFIG_FILE_NAME
+        )
+        self.broker_api_endpoint_var = tk.StringVar()
+        self.broker_api_token_var = tk.StringVar()
+        self._autosave_loading = False
+        self._autosave_dirty = False
+        self._autosave_after_id: str | None = None
+        self._autosave_trace_variables: set[str] = set()
+        self.cached_data_warnings: dict[str, str] = {}
 
         self._build_ui()
+        self._load_broker_api_config()
         self._add_default_allocation()
         self._refresh_allocation_choices()
+        if self.AUTOSAVE_ENABLED:
+            self._install_autosave_traces()
+            self._load_autosave_scenario()
+            self.protocol("WM_DELETE_WINDOW", self._close_app)
+        if self.STARTUP_REFRESH_ENABLED:
+            self._startup_refresh_after_id = self.after(
+                200, self._refresh_startup_data
+            )
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
@@ -844,8 +1337,13 @@ class RiskCalculatorApp(tk.Tk):
         self.notebook.bind("<<NotebookTabChanged>>", self._main_tab_changed)
 
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(12, 5)).pack(
-            fill="x", side="bottom"
+        status_bar = ttk.Frame(self, padding=(12, 5))
+        status_bar.pack(fill="x", side="bottom")
+        self.fetch_progress = ttk.Progressbar(
+            status_bar, mode="indeterminate", length=100
+        )
+        ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(
+            side="left", fill="x", expand=True
         )
 
     def _scenario_string_settings(self) -> dict[str, tk.StringVar]:
@@ -942,6 +1440,11 @@ class RiskCalculatorApp(tk.Tk):
                     "yahoo_ticker": str(values[1]),
                     "robot": allocation.robot,
                     "capital": str(allocation.capital),
+                    "allocation_percent": (
+                        str(self.allocation_percentages[row_id])
+                        if self.allocation_percentages.get(row_id) is not None
+                        else ""
+                    ),
                     "magic_number": self.magic_assignments.get(row_id),
                     "broker_contract": (
                         {
@@ -998,6 +1501,7 @@ class RiskCalculatorApp(tk.Tk):
                 "yahoo_ticker": self.yahoo_ticker_var.get(),
                 "robot": self.robot_var.get(),
                 "capital": self.capital_var.get(),
+                "allocation_percent": self.allocation_pct_var.get(),
             },
             "allocations": allocation_rows,
             "settings": {
@@ -1106,6 +1610,20 @@ class RiskCalculatorApp(tk.Tk):
                 raise ValueError(f"Allocation {position} has an invalid symbol or robot.")
             if decimal_value(capital_text, f"Allocation {position} capital") <= ZERO:
                 raise ValueError(f"Allocation {position} capital must be greater than zero.")
+            allocation_percent = raw.get("allocation_percent", "")
+            if allocation_percent != "":
+                if not isinstance(allocation_percent, str):
+                    raise ValueError(
+                        f"Allocation {position} percentage must be text."
+                    )
+                parsed_percent = decimal_value(
+                    allocation_percent, f"Allocation {position} percentage"
+                )
+                if not ZERO < parsed_percent <= ONE_HUNDRED:
+                    raise ValueError(
+                        f"Allocation {position} percentage must be greater than "
+                        "0 and no greater than 100."
+                    )
 
             raw_magic = raw.get("magic_number")
             if raw_magic is not None:
@@ -1495,15 +2013,18 @@ class RiskCalculatorApp(tk.Tk):
                         }
                     )
                 history_source = required_text(raw, "history_source")
-                if history_source not in ("", "Yahoo", "MT5 CSV"):
+                if history_source not in ("", "Yahoo", *BROKER_HISTORY_SOURCES):
                     raise ValueError(
                         f"Allocation {position} has an unsupported history source."
                     )
                 if parsed_bars:
                     computed_stress = calculate_historical_stress(parsed_bars)
-                    if historical_stress is None or history_source != "MT5 CSV":
+                    if (
+                        historical_stress is None
+                        or history_source not in BROKER_HISTORY_SOURCES
+                    ):
                         raise ValueError(
-                            f"Allocation {position} MT5 history bars need matching historical stress data."
+                            f"Allocation {position} broker history bars need matching historical stress data."
                         )
                     historical_stress = RiskCalculatorApp._historical_stress_data(
                         computed_stress
@@ -1512,9 +2033,9 @@ class RiskCalculatorApp(tk.Tk):
                         raise ValueError(
                             f"Allocation {position} MT5 history needs a saved reference quote."
                         )
-                if history_source == "MT5 CSV" and not parsed_bars:
+                if history_source in BROKER_HISTORY_SOURCES and not parsed_bars:
                     raise ValueError(
-                        f"Allocation {position} is marked MT5 CSV without stored bars."
+                        f"Allocation {position} is marked as broker history without stored bars."
                     )
             else:
                 history_source = "Yahoo" if historical_stress is not None else ""
@@ -1524,6 +2045,7 @@ class RiskCalculatorApp(tk.Tk):
                     "yahoo_ticker": ticker or yahoo_symbol_for(symbol, ""),
                     "robot": robot,
                     "capital": capital_text,
+                    "allocation_percent": allocation_percent,
                     "magic_number": raw_magic,
                     "broker_contract": normalized_contract,
                     "quote": normalized_quote,
@@ -1531,6 +2053,19 @@ class RiskCalculatorApp(tk.Tk):
                     "history_source": history_source,
                     "history_bars": history_bars,
                 }
+            )
+
+        total_allocation_percent = sum(
+            (
+                decimal_value(item["allocation_percent"], "Allocation percentage")
+                for item in normalized_allocations
+                if item["allocation_percent"]
+            ),
+            ZERO,
+        )
+        if total_allocation_percent > ONE_HUNDRED:
+            raise ValueError(
+                "The sum of account-allocation percentages cannot exceed 100%."
             )
 
         settings = required_mapping(data, "settings")
@@ -1696,6 +2231,176 @@ class RiskCalculatorApp(tk.Tk):
         self._update_robot_options()
         self.status_var.set(f"Scenario saved: {path}")
 
+    def _install_autosave_traces(self) -> None:
+        variables: dict[str, tk.Variable] = {
+            "account_capital": self.account_capital_var,
+            "currency": self.currency_var,
+            "daily_limit": self.daily_limit_var,
+            "remaining_daily_room": self.remaining_daily_loss_room_var,
+            "overall_room": self.prop_total_loss_room_var,
+            "limit_mode": self.limit_mode_var,
+            "new_symbol": self.index_var,
+            "new_ticker": self.yahoo_ticker_var,
+            "new_robot": self.robot_var,
+            "new_allocation_percent": self.allocation_pct_var,
+        }
+        variables.update(self._scenario_string_settings())
+        variables.update(self._scenario_boolean_settings())
+        variables.update(self._contract_input_variables())
+        variables["symbol_commission"] = self.symbol_commission_per_lot_var
+        variables["maximum_lot"] = self.maximum_lot_var
+        for variable in variables.values():
+            variable_name = str(variable)
+            if variable_name in self._autosave_trace_variables:
+                continue
+            variable.trace_add("write", self._schedule_autosave)
+            self._autosave_trace_variables.add(variable_name)
+
+    def _load_broker_api_config(self) -> None:
+        if not os.path.isfile(self.broker_api_config_path):
+            return
+        try:
+            with open(self.broker_api_config_path, "r", encoding="utf-8") as config_file:
+                config = json.load(config_file)
+            if not isinstance(config, dict) or not isinstance(
+                config.get("endpoint_template"), str
+            ):
+                raise ValueError("Broker API config must contain endpoint_template.")
+            validate_broker_api_endpoint(config["endpoint_template"])
+            self.broker_api_endpoint_var.set(config["endpoint_template"])
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            self.status_var.set(f"Could not load broker API endpoint: {error}")
+            messagebox.showwarning(
+                "Broker API configuration",
+                f"{error}\n\nThe configuration file was kept unchanged:\n"
+                f"{self.broker_api_config_path}",
+                parent=self,
+            )
+
+    def _save_broker_api_config(self, endpoint_template: str) -> None:
+        validate_broker_api_endpoint(endpoint_template)
+        directory = os.path.dirname(self.broker_api_config_path)
+        os.makedirs(directory, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".broker-api-",
+            suffix=".tmp",
+            dir=directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {"endpoint_template": endpoint_template.strip()},
+                    config_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                config_file.write("\n")
+            os.replace(temporary_path, self.broker_api_config_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def _schedule_autosave(self, *_args: str) -> None:
+        if self._autosave_loading or not self.AUTOSAVE_ENABLED:
+            return
+        self._autosave_dirty = True
+        if self._autosave_after_id is not None:
+            self.after_cancel(self._autosave_after_id)
+        self._autosave_after_id = self.after(700, self._save_autosave_scenario)
+
+    def _save_autosave_scenario(self) -> bool:
+        self._autosave_after_id = None
+        if self._autosave_loading or not self.AUTOSAVE_ENABLED:
+            return True
+        temporary_path = ""
+        try:
+            scenario_data = self._scenario_data()
+            self._validate_scenario(scenario_data)
+            directory = os.path.dirname(self.autosave_path)
+            os.makedirs(directory, exist_ok=True)
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".portfolio-",
+                suffix=".tmp",
+                dir=directory,
+                text=True,
+            )
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as scenario_file:
+                json.dump(
+                    scenario_data,
+                    scenario_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                scenario_file.write("\n")
+            os.replace(temporary_path, self.autosave_path)
+            temporary_path = ""
+            self._autosave_dirty = False
+            return True
+        except (OSError, TypeError, ValueError) as error:
+            self.status_var.set(f"Local JSON auto-save failed: {error}")
+            return False
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def _load_autosave_scenario(self) -> None:
+        if not self.AUTOSAVE_ENABLED:
+            return
+        source_path = self.autosave_path
+        if not os.path.isfile(source_path):
+            if not os.path.isfile(LEGACY_AUTOSAVE_PATH):
+                return
+            source_path = LEGACY_AUTOSAVE_PATH
+        try:
+            with open(source_path, "r", encoding="utf-8") as scenario_file:
+                scenario_data = json.load(scenario_file)
+            scenario = self._validate_scenario(scenario_data)
+            self._autosave_loading = True
+            try:
+                self._apply_scenario(scenario)
+            finally:
+                self._autosave_loading = False
+            self._autosave_dirty = False
+            if source_path != self.autosave_path:
+                self._autosave_dirty = True
+                if not self._save_autosave_scenario():
+                    raise OSError(
+                        f"Could not migrate the saved portfolio to {self.autosave_path}"
+                    )
+                self.status_var.set(
+                    f"Migrated saved portfolio and market history to: {self.autosave_path}"
+                )
+            else:
+                self.status_var.set(
+                    f"Loaded saved portfolio and market history: {self.autosave_path}"
+                )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            self.status_var.set(f"Could not load saved local portfolio: {error}")
+            messagebox.showwarning(
+                "Saved portfolio could not be loaded",
+                f"{error}\n\nThe file was kept unchanged:\n{source_path}",
+                parent=self,
+            )
+
+    def _close_app(self) -> None:
+        if self._autosave_after_id is not None:
+            self.after_cancel(self._autosave_after_id)
+            self._autosave_after_id = None
+        if self._autosave_dirty and not self._save_autosave_scenario():
+            messagebox.showerror(
+                "Could not save portfolio",
+                "The latest changes were not saved to the local JSON file. "
+                "Correct the issue before closing, or use Save scenario.",
+                parent=self,
+            )
+            return
+        if self._startup_refresh_after_id is not None:
+            self.after_cancel(self._startup_refresh_after_id)
+            self._startup_refresh_after_id = None
+        self.fetch_progress.stop()
+        self.destroy()
+
     def _load_scenario_dialog(self) -> None:
         path = filedialog.askopenfilename(
             parent=self,
@@ -1755,10 +2460,24 @@ class RiskCalculatorApp(tk.Tk):
         )
         self.robot_var.set(new_allocation["robot"])
         self.capital_var.set(new_allocation["capital"])
+        allocation_percent = new_allocation.get("allocation_percent", "")
+        if allocation_percent:
+            self.allocation_pct_var.set(allocation_percent)
+        else:
+            self.allocation_pct_var.set(
+                format_decimal(
+                    decimal_value(new_allocation["capital"], "Allocated capital")
+                    * ONE_HUNDRED
+                    / decimal_value(
+                        self.account_capital_var.get(), "Total account capital"
+                    )
+                )
+            )
 
         for row_id in self.allocation_tree.get_children():
             self.allocation_tree.delete(row_id)
         self.allocations.clear()
+        self.allocation_percentages.clear()
         self.allocation_results.clear()
         self.quotes.clear()
         self.historical_stresses.clear()
@@ -1780,6 +2499,7 @@ class RiskCalculatorApp(tk.Tk):
                 item["yahoo_ticker"],
                 item["robot"],
                 item["capital"],
+                item.get("allocation_percent") or None,
             )
             row_id = list(self.allocations)[-1]
             contracts_to_restore[row_id] = item["broker_contract"]
@@ -1848,7 +2568,7 @@ class RiskCalculatorApp(tk.Tk):
                 self.quotes[row_id] = quote_value
                 self.saved_quote_rows.add(row_id)
                 values = list(self.allocation_tree.item(row_id, "values"))
-                values[4] = (
+                values[5] = (
                     f"{format_decimal(quote_value[0])} {quote_value[1]} (saved)"
                 )
                 self.allocation_tree.item(row_id, values=values)
@@ -1933,6 +2653,13 @@ class RiskCalculatorApp(tk.Tk):
         ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
         ttk.Label(
             account,
+            text=(
+                "Enter each robot as a percentage of account capital; percentages "
+                "may total up to 100% and are converted to cash allocations."
+            ),
+        ).grid(row=1, column=7, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(
+            account,
             text="Remaining prop overall-loss room (cash; optional)",
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=(0, 5), pady=(5, 0))
         ttk.Entry(
@@ -1975,12 +2702,13 @@ class RiskCalculatorApp(tk.Tk):
         self.index_var.trace_add("write", self._suggest_yahoo_ticker)
         self.robot_var = tk.StringVar(value="RSI")
         self.capital_var = tk.StringVar(value="5000")
+        self.allocation_pct_var = tk.StringVar(value="50")
         for column, (label, variable, width) in enumerate(
             (
                 ("Broker symbol", self.index_var, 13),
                 ("Yahoo ticker", self.yahoo_ticker_var, 13),
                 ("Robot", self.robot_var, 10),
-                ("Capital assigned", self.capital_var, 14),
+                ("Account allocation (%)", self.allocation_pct_var, 14),
             )
         ):
             ttk.Label(entry_box, text=label).grid(
@@ -2009,7 +2737,15 @@ class RiskCalculatorApp(tk.Tk):
             padding=8,
         )
         table_box.pack(fill="both", expand=True)
-        columns = ("symbol", "ticker", "robot", "capital", "quote", "daily")
+        columns = (
+            "symbol",
+            "ticker",
+            "robot",
+            "capital",
+            "allocation_pct",
+            "quote",
+            "daily",
+        )
         self.allocation_tree = ttk.Treeview(
             table_box, columns=columns, show="headings", height=9, selectmode="browse"
         )
@@ -2018,6 +2754,7 @@ class RiskCalculatorApp(tk.Tk):
             "ticker": "Yahoo ticker",
             "robot": "Robot",
             "capital": "Capital",
+            "allocation_pct": "Account %",
             "quote": "Market reference price",
             "daily": "Daily risk budget",
         }
@@ -2026,6 +2763,7 @@ class RiskCalculatorApp(tk.Tk):
             "ticker": 130,
             "robot": 85,
             "capital": 120,
+            "allocation_pct": 90,
             "quote": 180,
             "daily": 180,
         }
@@ -2058,6 +2796,17 @@ class RiskCalculatorApp(tk.Tk):
             command=self._fetch_all_yahoo_data,
         )
         self.fetch_all_button.pack(side="left", padx=8)
+        self.fetch_mt5_button = ttk.Button(
+            actions,
+            text="Connect MT5: get specs + 5y D1",
+            command=self._fetch_mt5_terminal_data,
+        )
+        self.fetch_mt5_button.pack(side="left", padx=8)
+        ttk.Label(
+            actions,
+            text=f"Auto-saved JSON: {self.autosave_path}",
+            wraplength=470,
+        ).pack(side="right", padx=6)
         ttk.Button(
             actions,
             text="Import MT5 contract CSV",
@@ -2073,6 +2822,48 @@ class RiskCalculatorApp(tk.Tk):
             text="Calculate portfolio budgets",
             command=self._calculate_portfolio,
         ).pack(side="right")
+        broker_api_box = ttk.LabelFrame(
+            self.portfolio_tab,
+            text="Optional broker REST API (normalized JSON, HTTPS)",
+            style="Section.TLabelframe",
+            padding=8,
+        )
+        broker_api_box.pack(fill="x", pady=(2, 5))
+        ttk.Label(
+            broker_api_box,
+            text="Endpoint template",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(
+            broker_api_box,
+            textvariable=self.broker_api_endpoint_var,
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(broker_api_box, text="Bearer token (not saved)").grid(
+            row=0, column=2, sticky="w", padx=(0, 6)
+        )
+        ttk.Entry(
+            broker_api_box,
+            textvariable=self.broker_api_token_var,
+            show="*",
+            width=22,
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        self.fetch_broker_api_button = ttk.Button(
+            broker_api_box,
+            text="Fetch broker data",
+            command=self._fetch_broker_api_data,
+        )
+        self.fetch_broker_api_button.grid(row=0, column=4, sticky="e")
+        ttk.Label(
+            broker_api_box,
+            text=(
+                "URL placeholders: {symbol}, {start}, {end}, {interval}; "
+                "example: https://broker.example/api/history?symbol={symbol}"
+                "&from={start}&to={end}&interval={interval}. Uses five years of "
+                "daily bars. The endpoint must return the documented JSON schema "
+                "in README; API credentials belong only in the token field."
+            ),
+            wraplength=1080,
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(5, 0))
+        broker_api_box.columnconfigure(1, weight=1)
         ttk.Label(
             self.portfolio_tab,
             text=(
@@ -2086,6 +2877,10 @@ class RiskCalculatorApp(tk.Tk):
         ttk.Label(
             self.portfolio_tab,
             text=(
+                "Use Connect MT5 to read account currency, broker contract specs, "
+                "current price and 5 years of D1 bars directly from the logged-in "
+                "terminal (requires the MetaTrader5 Python package). Alternatively, "
+                "the inputs in Robot settings can be entered manually or imported. "
                 "MT5 CSV headers: symbol, point_size, "
                 "point_value_per_point_per_lot (in account currency), "
                 "account_currency, points_per_ea_pip, lot_step, min_lot, "
@@ -2094,7 +2889,7 @@ class RiskCalculatorApp(tk.Tk):
                 "largest peak-to-trough decline; daily shock remains available "
                 "as a separate stress mode. Legacy "
                 "profit_currency headers are accepted cautiously. "
-                "Create it with ExportMT5ContractSpecs.mq5. For broker OHLC "
+                "The CSV can be created with ExportMT5ContractSpecs.mq5. For broker OHLC "
                 "history use ExportMT5History.mq5; MT5 history is preferred "
                 "for the imported symbol and Yahoo remains the fallback."
             ),
@@ -2452,7 +3247,7 @@ class RiskCalculatorApp(tk.Tk):
         return entry
 
     def _add_default_allocation(self) -> None:
-        self._insert_allocation("US500", "^GSPC", "RSI", "5000")
+        self._insert_allocation("US500", "^GSPC", "RSI", "5000", "50")
 
     def _suggest_yahoo_ticker(self, *_args: str) -> None:
         current_ticker = self.yahoo_ticker_var.get().strip()
@@ -2467,6 +3262,7 @@ class RiskCalculatorApp(tk.Tk):
         ticker: str,
         robot: str,
         capital_text: str,
+        allocation_percent_text: str | None = None,
     ) -> None:
         symbol = symbol.strip()
         robot = robot.strip().upper()
@@ -2477,16 +3273,55 @@ class RiskCalculatorApp(tk.Tk):
         capital = decimal_value(capital_text, "Allocated capital")
         if capital <= ZERO:
             raise ValueError("Allocated capital must be greater than zero.")
+        allocation_percent = None
+        if allocation_percent_text is not None:
+            allocation_percent = decimal_value(
+                allocation_percent_text, "Account allocation percentage"
+            )
+            if not ZERO < allocation_percent <= ONE_HUNDRED:
+                raise ValueError(
+                    "Account allocation percentage must be greater than 0 and "
+                    "no greater than 100."
+                )
+            total_percentage = allocation_percent + sum(
+                (
+                    percentage
+                    for percentage in self.allocation_percentages.values()
+                    if percentage is not None
+                ),
+                ZERO,
+            )
+            if total_percentage > ONE_HUNDRED:
+                raise ValueError(
+                    "The sum of account-allocation percentages cannot exceed 100%."
+                )
+            account_capital = decimal_value(
+                self.account_capital_var.get(), "Total account capital"
+            )
+            if account_capital <= ZERO:
+                raise ValueError("Total account capital must be greater than zero.")
+            capital = account_capital * allocation_percent / ONE_HUNDRED
         ticker = yahoo_symbol_for(symbol, ticker)
         row_id = f"allocation-{self.next_allocation_id}"
         self.next_allocation_id += 1
         allocation = Allocation(symbol, robot, capital)
         self.allocations[row_id] = allocation
+        self.allocation_percentages[row_id] = allocation_percent
         self.allocation_tree.insert(
             "",
             "end",
             iid=row_id,
-            values=(symbol, ticker, robot, format_decimal(capital), "Not fetched", "Not calculated"),
+            values=(
+                symbol,
+                ticker,
+                robot,
+                format_decimal(capital),
+                format_decimal(allocation_percent)
+                if allocation_percent is not None
+                else "",
+                "Not fetched",
+                "Not calculated",
+            ),
         )
         self.allocation_results.clear()
         self._refresh_allocation_choices()
@@ -2498,6 +3333,7 @@ class RiskCalculatorApp(tk.Tk):
         )
         self.selected_allocation_var.set(label)
         self._selection_changed()
+        self._schedule_autosave()
 
     def _add_allocation(self) -> None:
         try:
@@ -2505,7 +3341,8 @@ class RiskCalculatorApp(tk.Tk):
                 self.index_var.get(),
                 self.yahoo_ticker_var.get(),
                 self.robot_var.get(),
-                self.capital_var.get(),
+                self.account_capital_var.get(),
+                self.allocation_pct_var.get(),
             )
             self.status_var.set("Allocation added.")
         except ValueError as error:
@@ -2519,6 +3356,7 @@ class RiskCalculatorApp(tk.Tk):
         row_id = selected[0]
         self.allocation_tree.delete(row_id)
         self.allocations.pop(row_id, None)
+        self.allocation_percentages.pop(row_id, None)
         self.allocation_results.clear()
         self.quotes.pop(row_id, None)
         self.historical_stresses.pop(row_id, None)
@@ -2532,6 +3370,7 @@ class RiskCalculatorApp(tk.Tk):
             self.current_settings_row = None
         self._refresh_allocation_choices()
         self.status_var.set("Allocation removed.")
+        self._schedule_autosave()
 
     def _refresh_allocation_choices(self) -> None:
         choices = []
@@ -2836,6 +3675,7 @@ class RiskCalculatorApp(tk.Tk):
             self.status_var.set(
                 f"Imported broker specifications for {matched} allocation(s)."
             )
+            self._schedule_autosave()
             if unmatched:
                 messagebox.showwarning(
                     "Some symbols were not matched",
@@ -2900,7 +3740,7 @@ class RiskCalculatorApp(tk.Tk):
                 )
                 self.saved_quote_rows.discard(row_id)
                 values = list(self.allocation_tree.item(row_id, "values"))
-                values[4] = f"{format_decimal(last_bar.close)} (MT5 history)"
+                values[5] = f"{format_decimal(last_bar.close)} (MT5 history)"
                 self.allocation_tree.item(row_id, values=values)
                 matched += 1
 
@@ -2916,6 +3756,7 @@ class RiskCalculatorApp(tk.Tk):
             self.status_var.set(
                 f"Imported {matched} MT5 OHLC history allocation(s) from {path}."
             )
+            self._schedule_autosave()
             if unmatched:
                 messagebox.showwarning(
                     "Some histories were not matched",
@@ -3189,6 +4030,29 @@ class RiskCalculatorApp(tk.Tk):
             account_capital, daily_limit, _daily_room, _prop_room, effective_cap = (
                 self._portfolio_risk_limits()
             )
+            allocated_percent = sum(
+                (
+                    percentage
+                    for percentage in self.allocation_percentages.values()
+                    if percentage is not None
+                ),
+                ZERO,
+            )
+            if allocated_percent > ONE_HUNDRED:
+                raise ValueError(
+                    "The sum of account-allocation percentages cannot exceed 100%."
+                )
+            for row_id, allocation in tuple(self.allocations.items()):
+                percentage = self.allocation_percentages.get(row_id)
+                if percentage is None:
+                    continue
+                capital = account_capital * percentage / ONE_HUNDRED
+                self.allocations[row_id] = Allocation(
+                    allocation.index, allocation.robot, capital
+                )
+                values = list(self.allocation_tree.item(row_id, "values"))
+                values[3] = format_decimal(capital)
+                self.allocation_tree.item(row_id, values=values)
             result = calculate_portfolio(
                 account_capital,
                 effective_cap,
@@ -3200,14 +4064,14 @@ class RiskCalculatorApp(tk.Tk):
             for row_id, allocation_result in self.allocation_results.items():
                 values = list(self.allocation_tree.item(row_id, "values"))
                 quote_data = self.quotes.get(row_id)
-                values[4] = (
+                values[5] = (
                     f"{format_decimal(quote_data[0])} {quote_data[1]}"
                     if quote_data
                     else "Not fetched"
                 )
                 if quote_data and row_id in self.saved_quote_rows:
-                    values[4] += " (saved)"
-                values[5] = (
+                    values[5] += " (saved)"
+                values[6] = (
                     f"{format_decimal(allocation_result.daily_loss_budget, 2)} "
                     f"{self.currency_var.get().strip() or 'account currency'}"
                 )
@@ -3252,6 +4116,77 @@ class RiskCalculatorApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, self._poll_quote_result)
 
+    def _refresh_startup_data(self) -> None:
+        self._startup_refresh_after_id = None
+        if self.quote_busy or not self.allocations:
+            return
+        requests = [
+            (
+                row_id,
+                allocation.index,
+                yahoo_symbol_for(
+                    allocation.index, self.allocation_tree.item(row_id, "values")[1]
+                ),
+                self.history_sources.get(row_id, ""),
+            )
+            for row_id, allocation in self.allocations.items()
+        ]
+        endpoint = self.broker_api_endpoint_var.get().strip()
+        account_currency = self.currency_var.get().strip().upper()
+        self._set_fetch_busy(True)
+        self.status_var.set("Refreshing saved market data at startup...")
+
+        def worker() -> None:
+            warnings: list[str] = []
+            for row_id, symbol, ticker, source in requests:
+                if source == "MT5 CSV":
+                    warnings.append(
+                        f"{symbol}: imported MT5 CSV snapshot retained; "
+                        "reimport the CSV or connect MT5 to refresh broker data."
+                    )
+                    continue
+                if source in ("MT5 terminal", "Broker API") or (
+                    not source and endpoint
+                ):
+                    try:
+                        if source == "MT5 terminal":
+                            currency, data = fetch_mt5_terminal_data([symbol])
+                            status = "startup_mt5_done"
+                        else:
+                            currency, data = fetch_broker_api_data(
+                                endpoint, "", [symbol]
+                            )
+                            status = "startup_api_done"
+                        if currency != account_currency:
+                            raise ValueError(
+                                f"Broker currency {currency} differs from the "
+                                f"configured account currency {account_currency}."
+                            )
+                        result = MT5PortfolioResult(
+                            {row_id: data[symbol.strip().upper()]}, currency
+                        )
+                        self.quote_messages.put((row_id, status, result))
+                    except (
+                        ValueError, OSError, KeyError, TypeError, AttributeError,
+                        OverflowError, InvalidOperation, RuntimeError,
+                    ) as error:
+                        detail = str(error)
+                        if source == "Broker API" or (not source and endpoint):
+                            detail += (
+                                " If authentication is required, enter the Bearer "
+                                "token and use Fetch broker data; tokens are not saved."
+                            )
+                        warnings.append(f"{symbol}: {detail} Saved data retained.")
+                    continue
+                result = self._request_yahoo_data(row_id, ticker)
+                if result.error:
+                    warnings.append(f"{symbol}: {result.error} Saved data retained.")
+                self.quote_messages.put((row_id, "startup_yahoo", result))
+            self.quote_messages.put(("__startup__", "startup_done", warnings))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_quote_result)
+
     def _fetch_all_yahoo_data(self, only_missing: bool = False) -> None:
         if self.quote_busy:
             return
@@ -3259,6 +4194,7 @@ class RiskCalculatorApp(tk.Tk):
         for row_id, allocation in self.allocations.items():
             if (
                 only_missing
+                and self.history_sources.get(row_id) in BROKER_HISTORY_SOURCES
                 and row_id in self.quotes
                 and row_id in self.historical_stresses
             ):
@@ -3289,6 +4225,114 @@ class RiskCalculatorApp(tk.Tk):
                 result = self._request_yahoo_data(row_id, ticker)
                 self.quote_messages.put((row_id, "batch_item", result))
             self.quote_messages.put(("__all__", "batch_done", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_quote_result)
+
+    def _fetch_mt5_terminal_data(self) -> None:
+        if self.quote_busy:
+            self.status_var.set("Wait for the current market-data request to finish.")
+            return
+        if not self.allocations:
+            self._show_portfolio_suggestion_error(
+                "Add at least one broker symbol before connecting to MT5."
+            )
+            return
+        if self.current_settings_row in self.allocations:
+            self._capture_contract_inputs(self.current_settings_row)
+        requested_rows = [
+            (row_id, allocation.index)
+            for row_id, allocation in self.allocations.items()
+        ]
+        self._set_fetch_busy(True)
+        self.status_var.set(
+            "Connecting to the logged-in MT5 terminal for contract specs and "
+            "five years of daily history..."
+        )
+
+        def worker() -> None:
+            try:
+                account_currency, symbols = fetch_mt5_terminal_data(
+                    [symbol for _, symbol in requested_rows],
+                    history_years=5,
+                )
+                rows = {
+                    row_id: symbols[symbol.strip().upper()]
+                    for row_id, symbol in requested_rows
+                }
+                result = MT5PortfolioResult(rows, account_currency)
+            except (
+                ValueError,
+                OSError,
+                TypeError,
+                AttributeError,
+                OverflowError,
+                InvalidOperation,
+                RuntimeError,
+            ) as error:
+                result = MT5PortfolioResult({}, "", str(error))
+            self.quote_messages.put(("__mt5__", "mt5_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_quote_result)
+
+    def _fetch_broker_api_data(self) -> None:
+        if self.quote_busy:
+            self.status_var.set("Wait for the current market-data request to finish.")
+            return
+        if not self.allocations:
+            self._show_portfolio_suggestion_error(
+                "Add at least one broker symbol before fetching broker API data."
+            )
+            return
+        endpoint = self.broker_api_endpoint_var.get().strip()
+        token = self.broker_api_token_var.get()
+        try:
+            validate_broker_api_endpoint(endpoint)
+            self._save_broker_api_config(endpoint)
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "Broker API configuration",
+                str(error),
+                parent=self,
+            )
+            self.status_var.set(f"Broker API configuration is invalid: {error}")
+            return
+
+        requested_rows = [
+            (row_id, allocation.index)
+            for row_id, allocation in self.allocations.items()
+        ]
+        self.broker_api_token_var.set("")
+        self._set_fetch_busy(True)
+        self.status_var.set(
+            "Fetching five years of daily broker quotes, contract specs and history..."
+        )
+
+        def worker() -> None:
+            try:
+                symbols = list(dict.fromkeys(symbol for _, symbol in requested_rows))
+                account_currency, symbols_data = fetch_broker_api_data(
+                    endpoint,
+                    token,
+                    symbols,
+                )
+                rows = {
+                    row_id: symbols_data[symbol.strip().upper()]
+                    for row_id, symbol in requested_rows
+                }
+                result = MT5PortfolioResult(rows, account_currency)
+            except (
+                ValueError,
+                OSError,
+                TypeError,
+                AttributeError,
+                OverflowError,
+                InvalidOperation,
+                RuntimeError,
+            ) as error:
+                result = MT5PortfolioResult({}, "", str(error))
+            self.quote_messages.put(("__broker_api__", "broker_api_done", result))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, self._poll_quote_result)
@@ -3331,10 +4375,19 @@ class RiskCalculatorApp(tk.Tk):
         self.quote_busy = busy
         if busy:
             self.quote_request_cancelled = False
+            self.fetch_progress.pack(side="right", padx=(10, 0))
+            self.fetch_progress.start(15)
+        else:
+            self.fetch_progress.stop()
+            self.fetch_progress.pack_forget()
         state = "disabled" if busy else "normal"
         self.fetch_button.configure(state=state)
         if self.fetch_all_button is not None:
             self.fetch_all_button.configure(state=state)
+        if self.fetch_mt5_button is not None:
+            self.fetch_mt5_button.configure(state=state)
+        if self.fetch_broker_api_button is not None:
+            self.fetch_broker_api_button.configure(state=state)
 
     def _poll_quote_result(self) -> None:
         try:
@@ -3344,11 +4397,117 @@ class RiskCalculatorApp(tk.Tk):
                 self.after(100, self._poll_quote_result)
             return
         if self.quote_request_cancelled:
-            if status in ("one", "batch_done"):
+            if status in (
+                "one",
+                "batch_done",
+                "mt5_done",
+                "broker_api_done",
+                "startup_done",
+            ):
                 self._set_fetch_busy(False)
                 self.quote_request_cancelled = False
             else:
                 self.after(100, self._poll_quote_result)
+            return
+        if status == "startup_done":
+            self._set_fetch_busy(False)
+            self._calculate_portfolio(show_error=False)
+            self._schedule_autosave()
+            if result:
+                self.status_var.set(
+                    "Startup refresh finished with warnings; saved data retained "
+                    "where refresh was unavailable."
+                )
+                messagebox.showwarning(
+                    "Startup data refresh", "\n".join(result), parent=self
+                )
+            else:
+                self.status_var.set("Startup market-data refresh completed.")
+            return
+        if status == "startup_yahoo":
+            self._apply_yahoo_data_result(result, refresh_settings=False)
+            if result.error:
+                self.cached_data_warnings[row_id] = result.error
+            self.after(100, self._poll_quote_result)
+            return
+        if status in (
+            "mt5_done", "broker_api_done", "startup_mt5_done", "startup_api_done"
+        ):
+            startup = status.startswith("startup_")
+            if not startup:
+                self._set_fetch_busy(False)
+            source_name = (
+                "MT5 terminal"
+                if status in ("mt5_done", "startup_mt5_done")
+                else "Broker API"
+            )
+            if not isinstance(result, MT5PortfolioResult):
+                self.status_var.set(
+                    f"{source_name} returned an invalid portfolio response."
+                )
+                messagebox.showerror(
+                    f"{source_name} data",
+                    "The returned result had an invalid format.",
+                    parent=self,
+                )
+                return
+            if result.error:
+                self.status_var.set(result.error)
+                messagebox.showerror(
+                    f"Could not read {source_name} contract/history",
+                    result.error,
+                    parent=self,
+                )
+                return
+            self.currency_var.set(result.account_currency)
+            for row_id, symbol_data in result.rows.items():
+                if row_id not in self.allocations:
+                    continue
+                contract = dict(symbol_data.contract)
+                if startup:
+                    saved_contract = self.contract_inputs.get(row_id, {})
+                    for field in ("points_per_pip", "commission_per_lot"):
+                        if not contract.get(field):
+                            contract[field] = saved_contract.get(field, "")
+                self.contract_inputs[row_id] = contract
+                self.history_bars[row_id] = symbol_data.bars
+                self.historical_stresses[row_id] = calculate_historical_stress(
+                    symbol_data.bars
+                )
+                self.history_sources[row_id] = source_name
+                self.saved_history_rows.discard(row_id)
+                self.cached_data_warnings.pop(row_id, None)
+                self.quotes[row_id] = symbol_data.quote
+                self.saved_quote_rows.discard(row_id)
+                values = list(self.allocation_tree.item(row_id, "values"))
+                values[5] = (
+                    f"{format_decimal(symbol_data.quote[0])} "
+                    f"{symbol_data.quote[1]} ({source_name})"
+                )
+                self.allocation_tree.item(row_id, values=values)
+            selected_row = self._selected_row_id()
+            if selected_row in self.allocations:
+                self._load_contract_inputs(selected_row)
+                selected_quote = self.quotes.get(selected_row)
+                if selected_quote is not None:
+                    self.reference_price_var.set(format_decimal(selected_quote[0]))
+                    self.stress_target_price_var.set("")
+                    self.auto_stress_target_price = None
+                    self._selection_changed()
+            self._calculate_portfolio(show_error=False)
+            self._schedule_autosave()
+            if startup:
+                self.status_var.set(
+                    f"Updated {source_name} data; finishing startup refresh..."
+                )
+                self.after(100, self._poll_quote_result)
+                return
+            self.status_var.set(
+                f"Read {source_name} contract specs, quotes and five-year D1 history for "
+                f"{len(result.rows)} allocation(s); account currency "
+                f"{result.account_currency}. Generating the portfolio estimate..."
+            )
+            self._suggest_portfolio_downside()
             return
         if status == "one":
             self._set_fetch_busy(False)
@@ -3380,11 +4539,20 @@ class RiskCalculatorApp(tk.Tk):
                 self._apply_yahoo_data_result(result, refresh_settings=False)
                 self.batch_completed += 1
                 if result.error:
-                    allocation = self.allocations.get(row_id)
-                    symbol = allocation.index if allocation is not None else row_id
-                    self.batch_errors.append(
-                        f"{symbol}: {result.error}"
-                    )
+                    if (
+                        row_id in self.quotes
+                        and row_id in self.historical_stresses
+                        and self.history_sources.get(row_id) == "Yahoo"
+                    ):
+                        self.cached_data_warnings[row_id] = result.error
+                    else:
+                        allocation = self.allocations.get(row_id)
+                        symbol = allocation.index if allocation is not None else row_id
+                        self.batch_errors.append(
+                            f"{symbol}: {result.error}"
+                        )
+                else:
+                    self.cached_data_warnings.pop(row_id, None)
                 self.status_var.set(
                     f"Fetched Yahoo data for {self.batch_completed} of "
                     f"{self.batch_total} allocation(s)..."
@@ -3394,6 +4562,7 @@ class RiskCalculatorApp(tk.Tk):
         if status == "batch_done":
             self._set_fetch_busy(False)
             self._calculate_portfolio(show_error=False)
+            self._schedule_autosave()
             portfolio_suggestion = self.portfolio_suggestion_pending
             self.portfolio_suggestion_pending = False
             if portfolio_suggestion and self.batch_errors:
@@ -3426,6 +4595,11 @@ class RiskCalculatorApp(tk.Tk):
                 self.status_var.set(
                     f"Fetched current prices and historical data for "
                     f"{self.batch_completed} allocation(s)."
+                )
+            elif self.cached_data_warnings:
+                self.status_var.set(
+                    "Some Yahoo refreshes failed; recommendations use the saved "
+                    "history snapshots. Review the report warnings."
                 )
             return
         self._set_fetch_busy(False)
@@ -3461,9 +4635,10 @@ class RiskCalculatorApp(tk.Tk):
             self.history_bars.pop(row_id, None)
             self.history_sources[row_id] = "Yahoo"
             self.saved_history_rows.discard(row_id)
+            self.cached_data_warnings.pop(row_id, None)
         price, currency, yahoo_symbol, timestamp = quote
         values = list(self.allocation_tree.item(row_id, "values"))
-        values[4] = f"{format_decimal(price)} {currency}"
+        values[5] = f"{format_decimal(price)} {currency}"
         self.allocation_tree.item(row_id, values=values)
         if self._selected_row_id() == row_id:
             historical = self.historical_stresses.get(row_id)
@@ -3490,6 +4665,7 @@ class RiskCalculatorApp(tk.Tk):
                 self.status_var.set(result.error)
             elif self.notebook.select() == str(self.settings_tab):
                 self._main_tab_changed()
+        self._schedule_autosave()
 
     def _begin_yahoo_batch(self, allocation_count: int) -> None:
         self.batch_total = allocation_count
@@ -3550,12 +4726,14 @@ class RiskCalculatorApp(tk.Tk):
         self.output_text.delete("1.0", "end")
         self.output_text.insert(
             "1.0",
-            "Using imported MT5 OHLC history where available and fetching Yahoo "
-            "data only for allocations without a price/history. The combined "
+            "Refreshing five-year Yahoo daily history for allocations without "
+            "broker MT5/API history. Imported broker history is retained. The combined "
             "downside suggestion will follow.\n",
         )
         if all(
-            row_id in self.quotes and row_id in self.historical_stresses
+            self.history_sources.get(row_id) in BROKER_HISTORY_SOURCES
+            and row_id in self.quotes
+            and row_id in self.historical_stresses
             for row_id in self.allocations
         ):
             self._generate_portfolio_settings_checked()
@@ -3595,6 +4773,10 @@ class RiskCalculatorApp(tk.Tk):
         step_value: Decimal,
         stress_percent: Decimal,
         max_trades: int,
+        selected_magic_number: int,
+        take_profit_type: str,
+        take_profit_value: str,
+        include_candidate_settings: bool = False,
     ) -> list[str]:
         currency = self.currency_var.get().strip() or "account currency"
         stress_mode = self.stress_mode_var.get()
@@ -3938,6 +5120,61 @@ class RiskCalculatorApp(tk.Tk):
                         f"worst day: {observed_date}"
                     )
                 )
+            if allocation_id in self.cached_data_warnings:
+                report.append(
+                    "  WARNING: Yahoo refresh failed; this allocation uses its "
+                    f"saved local snapshot. {self.cached_data_warnings[allocation_id]}"
+                )
+        if include_candidate_settings and rows:
+            report.extend(
+                [
+                    "",
+                    "PER-ROBOT CANDIDATE SETTINGS "
+                    "(sizing values; verify every EA input name and strategy value):",
+                ]
+            )
+            used_magic_numbers = set(self.magic_assignments.values())
+            used_magic_numbers.add(selected_magic_number)
+            next_magic_number = 10001
+            for (
+                symbol,
+                robot,
+                _row_percent,
+                row_trades,
+                lot,
+                _loss,
+                _status,
+                _observed_date,
+                _history_bars,
+                _history_source,
+                allocation_id,
+            ) in rows:
+                if allocation_id == selected_row:
+                    magic_number = selected_magic_number
+                else:
+                    magic_number = self.magic_assignments.get(allocation_id, 0)
+                    if not magic_number:
+                        while next_magic_number in used_magic_numbers:
+                            next_magic_number += 1
+                        magic_number = next_magic_number
+                        used_magic_numbers.add(magic_number)
+                        next_magic_number += 1
+                    self.magic_assignments[allocation_id] = magic_number
+                report.extend(
+                    [
+                        "",
+                        f"{symbol} | {robot} | {allocation_id}",
+                        f"Magic Number: {magic_number}",
+                        f"Max Trades: {row_trades}",
+                        f"Step Type: {step_type}",
+                        f"Step Value: {format_decimal(step_value)}",
+                        f"Take Profit Type: {take_profit_type}",
+                        f"Take Profit Value: {take_profit_value}",
+                        "Risk Type: Fixed lots",
+                        f"Risk: {format_decimal(lot)}",
+                        "Multiplier Factor: 1.0",
+                    ]
+                )
         if rows:
             report.extend(
                 [
@@ -3982,8 +5219,34 @@ class RiskCalculatorApp(tk.Tk):
                     report.append(
                         "Portfolio modeled loss is within the safety-reserved allowance."
                     )
-        if missing:
-            report.append("Not included (missing data): " + "; ".join(missing))
+        if missing or prop_loss_room is None:
+            if missing:
+                report.append("Not included (missing data): " + "; ".join(missing))
+            report.append(
+                "PORTFOLIO VERDICT: UNVERIFIED — complete market/contract data "
+                "and remaining prop overall-loss room are required for acceptance."
+            )
+        elif rows:
+            if total_estimated_loss <= portfolio_working_allowance:
+                report.append(
+                    "PORTFOLIO VERDICT: ACCEPTED under the configured historical "
+                    "stress model (at most 80% of allocated loss allowance; "
+                    "modeled risk grade: LOWER)."
+                )
+            elif total_estimated_loss <= allocated_daily_budget:
+                report.append(
+                    "PORTFOLIO VERDICT: NOT ACCEPTED under the 80% safety-buffer "
+                    "rule (modeled risk grade: ELEVATED; the loss buffer is exceeded)."
+                )
+            else:
+                report.append(
+                    "PORTFOLIO VERDICT: REJECTED — modeled loss exceeds the "
+                    "allocated prop-loss allowance (modeled risk grade: HIGH)."
+                )
+            report.append(
+                "This verdict applies only to the configured historical estimate; "
+                "it is not a prop-firm approval or a live-loss guarantee."
+            )
         if not rows:
             report.append(
                 "No combined estimate: import MT5 contract specifications and fetch "
@@ -4673,6 +5936,10 @@ class RiskCalculatorApp(tk.Tk):
             step_value,
             stress_percent,
             selected_trades,
+            magic_number,
+            take_profit_type,
+            take_profit_output,
+            require_complete_portfolio,
         )
         if require_complete_portfolio:
             missing_report = next(
@@ -4680,20 +5947,21 @@ class RiskCalculatorApp(tk.Tk):
                     line
                     for line in portfolio_report
                     if line.startswith("Not included (missing data):")
+                    or line.startswith("PORTFOLIO VERDICT: UNVERIFIED")
                 ),
                 None,
             )
             if missing_report:
                 raise ValueError(
-                    "Cannot model every allocation. " + missing_report
+                    "Cannot accept the full portfolio. " + missing_report
                 )
             if not any(
-                line == "Portfolio modeled loss is within the safety-reserved allowance."
+                line.startswith("PORTFOLIO VERDICT: ACCEPTED")
                 for line in portfolio_report
             ):
                 raise ValueError(
-                    "The combined modeled loss does not fit the portfolio's "
-                    "safety-reserved allowance."
+                    "The portfolio did not pass the configured 80% acceptance "
+                    "threshold; see the risk verdict in the report."
                 )
         output.extend(portfolio_report)
         output.extend(
@@ -4735,6 +6003,7 @@ class RiskCalculatorApp(tk.Tk):
         self.magic_assignments[row_id] = magic_number
         self.generated_output = "\n".join(output).strip()
         self.generated_scenario = self._scenario_data()
+        self._schedule_autosave()
         self.status_var.set(
             f"Settings generated for {allocation.index} / {robot}; review broker units."
         )
