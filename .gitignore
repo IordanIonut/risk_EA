@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-data/
 *.ex5
 ExportMT5History.log
 MT5EquityRiskGuard.log

@@ -120,7 +120,7 @@ def calculate_portfolio(
     daily_loss_limit: Decimal,
     allocations: Sequence[Allocation],
 ) -> PortfolioResult:
-    """Distribute the account's daily cash limit in proportion to allocated capital."""
+    """Distribute the account's full daily cap across active allocations by capital share."""
     if not account_capital.is_finite() or not daily_loss_limit.is_finite():
         raise ValueError("Account capital and daily loss limit must be finite numbers.")
     if account_capital <= ZERO:
@@ -148,7 +148,7 @@ def calculate_portfolio(
         AllocationResult(
             allocation=item,
             account_share_pct=item.capital * ONE_HUNDRED / account_capital,
-            daily_loss_budget=daily_loss_limit * item.capital / account_capital,
+            daily_loss_budget=daily_loss_limit * item.capital / allocated_capital,
         )
         for item in allocations
     )

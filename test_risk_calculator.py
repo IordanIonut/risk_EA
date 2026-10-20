@@ -153,12 +153,14 @@ class PortfolioInputValidationTests(unittest.TestCase):
 
     def test_valid_portfolio_keeps_proportional_budgets_and_reserve(self) -> None:
         result = calculate_portfolio(
-            Decimal("1000"), Decimal("100"),
+            Decimal("1000"), Decimal("90"),
             [Allocation("US500", "DCA", Decimal("250")),
              Allocation("US100", "RSI", Decimal("500"))],
         )
-        self.assertEqual(result.allocated_daily_budget, Decimal("75"))
-        self.assertEqual(result.reserved_daily_budget, Decimal("25"))
+        self.assertEqual(result.allocations[0].daily_loss_budget, Decimal("30"))
+        self.assertEqual(result.allocations[1].daily_loss_budget, Decimal("60"))
+        self.assertEqual(result.allocated_daily_budget, Decimal("90"))
+        self.assertEqual(result.reserved_daily_budget, Decimal("0"))
         self.assertEqual(result.reserved_capital, Decimal("250"))
 
 

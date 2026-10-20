@@ -174,6 +174,35 @@ class MT5TerminalDataTests(unittest.TestCase):
         self.assertIn("raw swap_long=-2", result["risk_details"])
         self.assertIn("NOT normalized cash", result["risk_details"])
 
+    def test_inspection_catalog_includes_contract_and_current_quote_for_each_symbol(self) -> None:
+        mt5 = SimpleNamespace(
+            terminal_info=lambda: SimpleNamespace(path="MT5", connected=True),
+            account_info=lambda: SimpleNamespace(currency="USD", trade_mode=0),
+            symbols_get=lambda: [SimpleNamespace(name="US500.cfd")],
+            TIMEFRAME_M1=1,
+            TIMEFRAME_D1=16385,
+            symbol_info=lambda _symbol: SimpleNamespace(
+                description="US 500 CFD", path="Indices\\US",
+                digits=1, point=0.1, trade_tick_size=0.1,
+                trade_tick_value_profit=1.0, trade_tick_value=1.0,
+                volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            ),
+            symbol_info_tick=lambda _symbol: SimpleNamespace(
+                bid=7000.0, ask=7000.1, last=7000.05, time=1234567890,
+            ),
+        )
+
+        result = APP["inspect_mt5_terminal"](mt5_module=mt5)
+        catalog = json.loads(result["symbol_catalog"])
+
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["symbol"], "US500.cfd")
+        self.assertTrue(catalog[0]["available_in_mt5"])
+        self.assertEqual(catalog[0]["point_value"], "1.0")
+        self.assertEqual(catalog[0]["volume_min"], "0.01")
+        self.assertEqual(catalog[0]["bid"], "7000.0")
+        self.assertEqual(catalog[0]["available_timeframes"], ["D1", "M1"])
+
     def test_inspection_identifies_demo_server_and_lists_exact_symbols_without_login(self) -> None:
         initialize = unittest.mock.Mock(return_value=True)
         shutdown = unittest.mock.Mock()
@@ -226,8 +255,10 @@ class MT5TerminalDataTests(unittest.TestCase):
             )
             for index in range(20)
         ]
+        timeframe_fetch = unittest.mock.Mock(return_value=rates[:2])
         mt5 = SimpleNamespace(
-            TIMEFRAME_D1=1,
+            TIMEFRAME_M1=1,
+            TIMEFRAME_D1=16385,
             terminal_info=lambda: object(),
             account_info=lambda: SimpleNamespace(currency="USD"),
             symbol_select=lambda _symbol, _visible: True,
@@ -242,6 +273,7 @@ class MT5TerminalDataTests(unittest.TestCase):
                 currency_profit="USD",
             ),
             copy_rates_range=lambda *_args: rates,
+            copy_rates_from_pos=timeframe_fetch,
             symbol_info_tick=lambda _symbol: SimpleNamespace(
                 ask=100.2,
                 bid=100.1,
@@ -253,6 +285,7 @@ class MT5TerminalDataTests(unittest.TestCase):
         account_currency, data = APP["fetch_mt5_terminal_data"](
             ["US500.cash"],
             mt5_module=mt5,
+            include_timeframes=True,
         )
 
         symbol = data["US500.CASH"]
@@ -263,6 +296,16 @@ class MT5TerminalDataTests(unittest.TestCase):
         self.assertEqual(symbol.quote[0], Decimal("100.2"))
         self.assertEqual(len(symbol.bars), 20)
         self.assertEqual(symbol.bars[0].spread_points, Decimal("8"))
+        self.assertEqual(set(symbol.timeframe_charts), {"D1", "M1"})
+        self.assertEqual(len(symbol.timeframe_charts["M1"]), 2)
+        self.assertEqual(len(symbol.timeframe_charts["D1"]), 20)
+
+        timeframe_fetch.reset_mock()
+        _, startup_data = APP["fetch_mt5_terminal_data"](
+            ["US500.cash"], mt5_module=mt5
+        )
+        timeframe_fetch.assert_not_called()
+        self.assertEqual(startup_data["US500.CASH"].timeframe_charts, {})
 
     def test_rejects_terminal_that_cannot_initialize(self) -> None:
         mt5 = SimpleNamespace(
@@ -933,9 +976,7 @@ class MT5ContractCsvTests(unittest.TestCase):
 
 class MT5SetTemplateTests(unittest.TestCase):
     def test_builds_a_dca_template_with_enum_values(self) -> None:
-        preset = build_mt5_set_template(
-            "DCA",
-            {
+        settings = {
                 "Magic Number": "10001",
                 "Max Trades": "4",
                 "Step Type": "enum_fixed_pips",
@@ -950,13 +991,46 @@ class MT5SetTemplateTests(unittest.TestCase):
                 "Reference Price": "0",
                 "Trade on new candle": "true",
                 "Show Invested Money": "true",
-            },
-        )
+        }
+        preset = build_mt5_set_template("DCA", settings)
 
         self.assertIn("StepType=1||0||0||0||N", preset)
         self.assertIn("TakeProfitType=0||0||0||0||N", preset)
         self.assertIn("InpPriceBreakType=0||0||0||0||N", preset)
         self.assertIn("EntryOnPriceBreak=false||0||0||0||N", preset)
+        settings["InpPriceBreakType"] = "break above"
+        preset_above = build_mt5_set_template("DCA", settings)
+        self.assertIn("InpPriceBreakType=1||0||0||0||N", preset_above)
+
+    def test_allows_cash_and_minimum_volume_zero_risk_but_not_balance_percent(self) -> None:
+        settings = {
+            "Magic Number": "10001",
+            "Max Trades": "1",
+            "Step Type": "enum_fixed_pips",
+            "Step Value": "25",
+            "Take Profit Type": "enum_fixed_pips",
+            "Take Profit Value": "20",
+            "Risk Type": "Fixed lots",
+            "Risk": "0.0",
+            "Multiplier Factor": "1.0",
+            "Entry on price break": "false",
+            "InpPriceBreakType": "break Below",
+            "Reference Price": "0",
+            "Trade on new candle": "true",
+            "Show Invested Money": "true",
+        }
+        preset = build_mt5_set_template("DCA", settings)
+        self.assertIn("RiskType=0||0||0||0||N", preset)
+        self.assertIn("Risk=0.0||0||0||0||N", preset)
+
+        settings["Risk Type"] = "Cash"
+        settings["Risk"] = "100"
+        cash_preset = build_mt5_set_template("DCA", settings)
+        self.assertIn("RiskType=1||0||0||0||N", cash_preset)
+
+        settings["Risk Type"] = "Balance percent"
+        with self.assertRaisesRegex(ValueError, "Unsupported Risk Type"):
+            build_mt5_set_template("DCA", settings)
 
     def test_builds_an_rsi_template_and_rejects_missing_settings(self) -> None:
         preset = build_mt5_set_template(
@@ -1746,8 +1820,13 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertIn("free margin", report)
         self.assertIn("Overnight debit reserve: 6", report)
         self.assertIn("ADVANCED PROP / MARGIN", report)
-        with self.assertRaisesRegex(ValueError, "advanced constraints"):
-            self.app._generate_settings_checked(show_errors=False, require_complete_portfolio=True)
+        self.app._generate_settings_checked(
+            show_errors=False, require_complete_portfolio=True
+        )
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("PORTFOLIO VERDICT: REJECTED", report)
+        with self.assertRaisesRegex(ValueError, "only be copied or exported"):
+            self.app._validated_generated_output()
 
     def test_advanced_missing_margin_input_is_explicitly_unverified(self) -> None:
         self._enable_advanced_checks()
@@ -1782,15 +1861,15 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(saved["daily_limit"], "500")
         self.assertEqual(saved["risk_profile"], self.app.risk_profile)
 
-    def test_enabled_advanced_checks_can_accept_a_fully_specified_manual_stress(self) -> None:
+    def test_enabled_advanced_idea_cap_rejects_full_account_sized_candidate(self) -> None:
         self._enable_advanced_checks()
         self.app.stress_mode_var.set("Adverse move (%)")
         self.app.stress_pct_var.set("10")
         self.app._generate_settings_checked(show_errors=False)
         report = self.app.output_text.get("1.0", "end")
-        self.assertIn("PORTFOLIO VERDICT: ACCEPTED", report)
+        self.assertIn("PORTFOLIO VERDICT: REJECTED", report)
         self.assertNotIn("ADVANCED MISSING:", report)
-        self.assertNotIn("ADVANCED BREACH:", report)
+        self.assertIn("ADVANCED BREACH:", report)
         self.assertIn("Overnight debit reserve: 6", report)
 
     def test_equity_import_and_saved_report_reopen_are_connected_to_ui(self) -> None:
@@ -1816,6 +1895,7 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app.AUTOSAVE_ENABLED = True
         with tempfile.TemporaryDirectory() as directory:
             self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.symbol_commission_per_lot_var.set("7")
             self.assertTrue(self.app._save_autosave_scenario())
             self.app.risk_profile = default_profile()
             self.app.exposure_inputs.clear()
@@ -1990,10 +2070,15 @@ class CandidateGenerationTests(unittest.TestCase):
         report = self.app.output_text.get("1.0", "end")
         self.assertIn("PORTFOLIO VERDICT: UNVERIFIED", report)
         self.assertNotIn("PORTFOLIO VERDICT: ACCEPTED", report)
-        with self.assertRaisesRegex(ValueError, "UNVERIFIED"):
-            self.app._generate_settings_checked(
-                show_errors=False, require_complete_portfolio=True,
-            )
+        self.app._generate_settings_checked(
+            show_errors=False, require_complete_portfolio=True,
+        )
+        self.assertIn(
+            "PORTFOLIO VERDICT: UNVERIFIED",
+            self.app.output_text.get("1.0", "end"),
+        )
+        with self.assertRaisesRegex(ValueError, "only be copied or exported"):
+            self.app._validated_generated_output()
 
     def _open_prop_preview(self) -> None:
         self.app.prop_website_snapshot = PropWebsiteTests.snapshot()
@@ -2228,6 +2313,126 @@ class CandidateGenerationTests(unittest.TestCase):
             self.assertFalse(self.app.quote_busy)
             self.assertEqual(self.app.fetch_progress.winfo_manager(), "")
 
+    def test_portfolio_ui_uses_direct_mt5_without_file_import_or_rest_controls(self) -> None:
+        widgets = [self.app]
+        labels = []
+        while widgets:
+            widget = widgets.pop()
+            try:
+                text = widget.cget("text")
+                if isinstance(text, str):
+                    labels.append(text)
+            except APP["tk"].TclError:
+                pass
+            widgets.extend(widget.winfo_children())
+
+        self.assertIn("Connect MT5: get specs + 5y D1", labels)
+        self.assertIsNotNone(self.app.broker_symbol_combo)
+        self.assertIn(
+            self.app.index_var.get(), self.app.broker_symbol_combo["values"]
+        )
+        for removed_control in (
+            "Import MT5 contract CSV",
+            "Import MT5 OHLC history CSV",
+            "Broker REST API (normalized JSON, HTTPS)",
+            "Endpoint template",
+            "Fetch broker data",
+        ):
+            self.assertFalse(any(removed_control in label for label in labels))
+
+    def test_mt5_symbol_inspection_populates_dropdown_and_creates_symbol_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.mt5_connection = {
+                "symbols": "NAS100.cash\nUS500.cfd",
+            }
+            self.app.mt5_symbol_catalog = {
+                "NAS100.cash": {
+                    "symbol": "NAS100.cash",
+                    "point_size": "0.1",
+                    "point_value": "1.0",
+                },
+                "US500.cfd": {
+                    "symbol": "US500.cfd",
+                    "point_size": "0.1",
+                    "point_value": "1.0",
+                },
+            }
+            us500_catalog = (
+                Path(directory) / "US500.cfd" / "symbol.json"
+            )
+            us500_catalog.parent.mkdir(parents=True)
+            us500_catalog.write_text(
+                json.dumps({"symbol": "US500.cfd", "available_in_mt5": False}),
+                encoding="utf-8",
+            )
+            self.app._refresh_broker_symbol_choices(register_terminal_symbols=True)
+
+            values = self.app.broker_symbol_combo["values"]
+            self.assertIn("NAS100.cash", values)
+            self.assertIn("US500.cfd", values)
+            for symbol in ("NAS100.cash", "US500.cfd"):
+                catalog = json.loads(
+                    (
+                        Path(self.app._symbol_data_directory(symbol)) / "symbol.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(catalog["symbol"], symbol)
+                self.assertTrue(catalog["available_in_mt5"])
+                self.assertEqual(catalog["point_value"], "1.0")
+
+    def test_autosave_writes_per_symbol_market_data_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.AUTOSAVE_ENABLED = True
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.assertTrue(self.app._save_autosave_scenario())
+
+            cache = json.loads(
+                (
+                    Path(self.app._symbol_data_directory("US500"))
+                    / "market_data.json"
+                ).read_text(encoding="utf-8")
+            )
+        self.assertEqual(cache["symbol"], "US500")
+        self.assertEqual(cache["format"], "mt5-risk-planner-symbol-data")
+        self.assertEqual(cache["broker_contract"]["point_size"], "1")
+        self.assertEqual(len(cache["history_bars"]), 20)
+
+    def test_timeframe_charts_are_saved_in_the_symbol_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app._save_symbol_timeframe_charts(
+                "US500.cfd",
+                {
+                    "M1": [{"time": "2026-10-20T12:00:00Z", "close": "7000"}],
+                    "D1": [{"time": "2026-10-20T00:00:00Z", "close": "7000"}],
+                },
+            )
+            root = Path(self.app._symbol_data_directory("US500.cfd")) / "charts"
+            minute = json.loads((root / "M1.json").read_text(encoding="utf-8"))
+            daily = json.loads((root / "D1.json").read_text(encoding="utf-8"))
+            catalog = json.loads(
+                (root.parent / "symbol.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(minute["timeframe"], "M1")
+        self.assertEqual(daily["timeframe"], "D1")
+        self.assertEqual(catalog["collected_timeframes"], ["D1", "M1"])
+
+    def test_new_install_does_not_create_a_hardcoded_symbol_allocation(self) -> None:
+        app_class = APP["RiskCalculatorApp"]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            app_class.__init__.__globals__, APP_DATA_DIRECTORY=directory
+        ), patch.object(app_class, "AUTOSAVE_ENABLED", False), patch.object(
+            app_class, "STARTUP_REFRESH_ENABLED", False
+        ):
+            app = app_class()
+        try:
+            self.assertEqual(app.index_var.get(), "")
+            self.assertEqual(app.allocations, {})
+        finally:
+            app.destroy()
+
     def test_loading_indicator_animates_without_blocking_tk_event_loop(self) -> None:
         self.app._set_fetch_busy(True)
         initial = self.app.fetch_progress["value"]
@@ -2265,6 +2470,87 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(self.app.quotes[self.row][0], Decimal("101"))
         self.assertIn("completed", self.app.status_var.get())
 
+    def test_startup_modal_unlocks_after_missing_data_is_collected(self) -> None:
+        self.app.deiconify()
+        self.app.update_idletasks()
+        self.app.quotes.pop(self.row)
+        self.app.history_sources[self.row] = "Yahoo"
+        result = APP["YahooDataResult"](
+            self.row,
+            (Decimal("101"), "USD", "^GSPC", "now"),
+            self.app.historical_stresses[self.row],
+            None,
+        )
+        with patch.object(self.app, "_request_yahoo_data", return_value=result):
+            self._run_startup_worker()
+
+        wait_window = self.app.startup_wait_window
+        self.assertIsNotNone(wait_window)
+        self.assertIs(self.app.grab_current(), wait_window)
+        with patch.object(self.app, "after"):
+            self.app._poll_quote_result()
+            self.assertIs(self.app.startup_wait_window, wait_window)
+            self.app._poll_quote_result()
+        self.assertIsNone(self.app.startup_wait_window)
+        self.assertNotEqual(self.app.grab_current(), wait_window)
+
+    def test_startup_modal_fetches_missing_contract_from_mt5(self) -> None:
+        self.app.deiconify()
+        self.app.update_idletasks()
+        self.app.history_sources[self.row] = "Yahoo"
+        self.app.contract_inputs[self.row]["point_value"] = ""
+        self.app.point_value_var.set("")
+        refreshed_contract = dict(self.app.contract_inputs[self.row])
+        refreshed_contract["point_value"] = "1"
+        data = APP["MT5SymbolData"](
+            refreshed_contract,
+            self.app.history_bars[self.row],
+            (Decimal("102"), "USD", "US500", "now"),
+        )
+        fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
+        with patch.dict(
+            self.app._refresh_startup_data.__globals__,
+            fetch_mt5_terminal_data=fetch,
+        ):
+            self._run_startup_worker()
+
+        wait_window = self.app.startup_wait_window
+        self.assertIsNotNone(wait_window)
+        fetch.assert_called_once_with(["US500"])
+        with patch.object(self.app, "after"), patch.object(
+            self.app, "_suggest_portfolio_downside"
+        ) as suggest:
+            self.app._poll_quote_result()
+            self.assertIs(self.app.startup_wait_window, wait_window)
+            self.app._poll_quote_result()
+        self.assertIsNone(self.app.startup_wait_window)
+        self.assertEqual(self.app.contract_inputs[self.row]["point_value"], "1")
+        self.assertEqual(self.app.history_sources[self.row], "MT5 terminal")
+        suggest.assert_not_called()
+
+    def test_startup_modal_unlocks_after_refresh_failure(self) -> None:
+        self.app.deiconify()
+        self.app.update_idletasks()
+        self.app.quotes.pop(self.row)
+        self.app.history_sources[self.row] = "Yahoo"
+        result = APP["YahooDataResult"](
+            self.row, None, None, "Price request failed: Offline"
+        )
+        with patch.object(self.app, "_request_yahoo_data", return_value=result):
+            self._run_startup_worker()
+
+        wait_window = self.app.startup_wait_window
+        self.assertIsNotNone(wait_window)
+        self.assertIs(self.app.grab_current(), wait_window)
+        with patch.object(self.app, "after"), patch.object(
+            APP["messagebox"], "showwarning"
+        ) as warning:
+            self.app._poll_quote_result()
+            self.app._poll_quote_result()
+        self.assertIsNone(self.app.startup_wait_window)
+        self.assertNotEqual(self.app.grab_current(), wait_window)
+        warning.assert_called_once()
+
     def test_startup_refresh_uses_saved_terminal_source_without_changing_account(self) -> None:
         self.app.history_sources[self.row] = "MT5 terminal"
         data = APP["MT5SymbolData"](
@@ -2287,6 +2573,36 @@ class CandidateGenerationTests(unittest.TestCase):
         suggest.assert_not_called()
         self.assertEqual(self.app.quotes[self.row][0], Decimal("102"))
         self.assertEqual(self.app.currency_var.get(), "USD")
+        self.assertFalse(self.app.quote_busy)
+
+    def test_startup_mt5_refresh_fetches_duplicate_symbol_only_once(self) -> None:
+        self.app.deiconify()
+        self.app.update_idletasks()
+        self.app.history_sources[self.row] = "MT5 terminal"
+        self.app._insert_allocation("US500", "^GSPC", "DCA", "1000")
+        rows = list(self.app.allocations)
+        self.app.history_sources[rows[1]] = "MT5 terminal"
+        data = APP["MT5SymbolData"](
+            dict(self.app.contract_inputs[rows[0]]),
+            self.app.history_bars[rows[0]],
+            (Decimal("102"), "USD", "US500", "now"),
+        )
+        fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
+        refresh = self.app._refresh_startup_data
+        with patch.dict(
+            refresh.__globals__, fetch_mt5_terminal_data=fetch
+        ):
+            self._run_startup_worker()
+
+        fetch.assert_called_once_with(["US500"])
+        with patch.object(self.app, "after"), patch.object(
+            APP["messagebox"], "showwarning"
+        ) as warning:
+            for _ in range(3):
+                self.app._poll_quote_result()
+        warning.assert_not_called()
+        self.assertEqual(self.app.history_sources[rows[0]], "MT5 terminal")
+        self.assertEqual(self.app.history_sources[rows[1]], "MT5 terminal")
         self.assertFalse(self.app.quote_busy)
 
     def test_startup_terminal_refresh_preserves_manual_commission_and_pip_conversion(self) -> None:
@@ -2320,47 +2636,52 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertIn("CSV snapshot retained", warning.call_args.args[1])
         self.assertFalse(self.app.quote_busy)
 
-    def test_startup_api_failure_keeps_saved_data_and_stops_indicator(self) -> None:
+    def test_legacy_broker_api_source_uses_yahoo_without_rest_url(self) -> None:
         self.app.history_sources[self.row] = "Broker API"
         self.app.broker_api_endpoint_var.set(
             "https://broker.example/history?symbol={symbol}"
         )
-        before = self.app.quotes[self.row]
-        refresh = self.app._refresh_startup_data
-        with patch.dict(
-            refresh.__globals__,
-            fetch_broker_api_data=lambda *_args: (_ for _ in ()).throw(
-                ValueError("HTTP 401")
-            ),
-        ):
-            self._run_startup_worker()
-        with patch.object(APP["messagebox"], "showwarning") as warning:
-            self.app._poll_quote_result()
-        self.assertIn("HTTP 401", warning.call_args.args[1])
-        self.assertIn("token", warning.call_args.args[1])
-        self.assertEqual(self.app.quotes[self.row], before)
-        self.assertFalse(self.app.quote_busy)
-        self.assertEqual(self.app.fetch_progress.winfo_manager(), "")
-
-    def test_startup_api_uses_saved_endpoint_without_saving_or_requesting_a_token(self) -> None:
-        self.app.history_sources[self.row] = "Broker API"
-        endpoint = "https://broker.example/history?symbol={symbol}"
-        self.app.broker_api_endpoint_var.set(endpoint)
-        data = APP["MT5SymbolData"](
-            self.app.contract_inputs[self.row],
-            self.app.history_bars[self.row],
-            (Decimal("103"), "USD", "US500", "now"),
+        result = APP["YahooDataResult"](
+            self.row,
+            (Decimal("104"), "USD", "^GSPC", "now"),
+            self.app.historical_stresses[self.row],
+            None,
         )
-        fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
-        with patch.dict(
-            self.app._refresh_startup_data.__globals__, fetch_broker_api_data=fetch
-        ):
+        with patch.object(self.app, "_request_yahoo_data", return_value=result) as fetch:
             self._run_startup_worker()
-        fetch.assert_called_once_with(endpoint, "", ["US500"])
+        fetch.assert_called_once_with(self.row, "^GSPC")
         with patch.object(self.app, "after"):
             self.app._poll_quote_result()
             self.app._poll_quote_result()
-        self.assertEqual(self.app.quotes[self.row][0], Decimal("103"))
+        self.assertEqual(self.app.quotes[self.row][0], Decimal("104"))
+        self.assertEqual(self.app.history_sources[self.row], "Yahoo")
+        self.assertFalse(self.app.quote_busy)
+
+    def test_legacy_broker_api_missing_contract_uses_mt5_directly(self) -> None:
+        self.app.history_sources[self.row] = "Broker API"
+        self.app.contract_inputs[self.row]["point_value"] = ""
+        self.app.point_value_var.set("")
+        contract = dict(self.app.contract_inputs[self.row])
+        contract["point_value"] = "1"
+        data = APP["MT5SymbolData"](
+            contract,
+            self.app.history_bars[self.row],
+            (Decimal("105"), "USD", "US500", "now"),
+        )
+        fetch_mt5 = unittest.mock.Mock(return_value=("USD", {"US500": data}))
+        fetch_api = unittest.mock.Mock()
+        with patch.dict(
+            self.app._refresh_startup_data.__globals__,
+            fetch_broker_api_data=fetch_api,
+            fetch_mt5_terminal_data=fetch_mt5,
+        ):
+            self._run_startup_worker()
+        fetch_mt5.assert_called_once_with(["US500"])
+        fetch_api.assert_not_called()
+        with patch.object(self.app, "after"):
+            self.app._poll_quote_result()
+            self.app._poll_quote_result()
+        self.assertEqual(self.app.quotes[self.row][0], Decimal("105"))
         self.assertFalse(self.app.quote_busy)
 
     def test_startup_failure_does_not_stop_other_allocations(self) -> None:
@@ -2432,10 +2753,31 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app.AUTOSAVE_ENABLED = True
         with tempfile.TemporaryDirectory() as directory:
             self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.symbol_commission_per_lot_var.set("7")
             self.assertTrue(self.app._save_autosave_scenario())
             saved = json.loads(Path(self.app.autosave_path).read_text(encoding="utf-8"))
             self.assertEqual(saved["format"], "mt5-risk-planner-scenario")
-            self.assertEqual(len(saved["allocations"][0]["history_bars"]), 20)
+            self.assertEqual(saved["version"], 15)
+            for market_field in (
+                "quote", "historical_stress", "history_source", "history_bars"
+            ):
+                self.assertNotIn(market_field, saved["allocations"][0])
+            self.assertEqual(
+                saved["allocations"][0]["broker_contract"],
+                {"points_per_pip": "1", "commission_per_lot": "7"},
+            )
+            for market_field in (
+                "point_value", "point_size", "contract_currency", "lot_increment",
+                "minimum_lot", "points_per_pip",
+            ):
+                self.assertNotIn(market_field, saved["settings"]["text"])
+            symbol_cache = json.loads(
+                (
+                    Path(self.app._symbol_data_directory("US500"))
+                    / "market_data.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(symbol_cache["history_bars"]), 20)
 
             self.app.account_capital_var.set("12000")
             self.app.history_bars.clear()
@@ -2449,6 +2791,50 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(
             self.app.contract_inputs[restored_row]["point_value"], "1"
         )
+        self.assertEqual(self.app.point_value_var.get(), "1")
+        self.assertEqual(self.app.point_size_var.get(), "1")
+        self.assertEqual(self.app.symbol_commission_per_lot_var.get(), "7")
+        self.assertEqual(self.app.points_per_pip_var.get(), "1")
+
+    def test_legacy_v14_autosave_migrates_market_data_into_symbol_cache(self) -> None:
+        self.app.AUTOSAVE_ENABLED = True
+        legacy = self.app._scenario_data()
+        legacy["version"] = 14
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            Path(self.app.autosave_path).write_text(
+                json.dumps(legacy), encoding="utf-8"
+            )
+
+            self.app._load_autosave_scenario()
+
+            migrated = json.loads(
+                Path(self.app.autosave_path).read_text(encoding="utf-8")
+            )
+            cache = json.loads(
+                (
+                    Path(self.app._symbol_data_directory("US500"))
+                    / "market_data.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        allocation = migrated["allocations"][0]
+        self.assertEqual(migrated["version"], 15)
+        for market_field in (
+            "quote", "historical_stress", "history_source", "history_bars"
+        ):
+            self.assertNotIn(market_field, allocation)
+        self.assertNotIn("point_value", allocation["broker_contract"])
+        self.assertEqual(allocation["broker_contract"]["points_per_pip"], "1")
+        for market_field in (
+            "point_value", "point_size", "contract_currency", "lot_increment",
+            "minimum_lot", "points_per_pip",
+        ):
+            self.assertNotIn(market_field, migrated["settings"]["text"])
+        self.assertEqual(len(cache["history_bars"]), 20)
+        restored_row = next(iter(self.app.allocations))
+        self.assertEqual(self.app.quotes[restored_row][0], Decimal("100"))
+        self.assertEqual(self.app.contract_inputs[restored_row]["point_value"], "1")
 
     def test_portfolio_downside_refreshes_yahoo_but_preserves_mt5_history(self) -> None:
         self.app.history_sources[self.row] = "Yahoo"
@@ -2744,15 +3130,30 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(self.app._selected_row_id(), first)
         self.assertEqual(set(self.app.selection_ids.values()), {first})
 
-    def test_duplicate_allocations_are_both_reported_with_separate_budgets(self) -> None:
+    def test_two_30_percent_robots_share_the_daily_risk_cap(self) -> None:
         scenario = self.app._scenario_data()
+        scenario["allocations"][0]["capital"] = "3000"
+        scenario["allocations"][0]["allocation_percent"] = "30"
         other = deepcopy(scenario["allocations"][0])
-        other["capital"] = "1000"
+        other["robot"] = "DCA"
         other["broker_contract"]["point_value"] = "7"
+        other["magic_number"] = None
         scenario["allocations"].append(other)
         scenario["selected_allocation"] = 0
         self.app._apply_scenario(validate_scenario(scenario))
         rows = list(self.app.allocations)
+        self.assertTrue(self.app._calculate_portfolio(show_error=False))
+        self.assertEqual(
+            [self.app.allocation_results[row].daily_loss_budget for row in rows],
+            [Decimal("225.0"), Decimal("225.0")],
+        )
+        self.assertEqual(
+            sum(
+                (self.app.allocation_results[row].daily_loss_budget for row in rows),
+                Decimal("0"),
+            ),
+            Decimal("450.0"),
+        )
         for index, row in enumerate(rows):
             with self.subTest(row=row):
                 self._select_row(row)
@@ -2760,17 +3161,34 @@ class CandidateGenerationTests(unittest.TestCase):
                 report = self.app._validated_generated_output()
                 self.assertIn(f"\nAllocation ID: {row}\n", report)
                 self.assertIn(
-                    f"Allocation ID: {rows[0]}; capital 5000 USD; risk allowance (80%): 180 USD.",
+                    f"Allocation ID: {rows[0]}; capital 3000 USD; risk allowance (80%): 180 USD.",
                     report,
                 )
                 self.assertIn(
-                    f"Allocation ID: {rows[1]}; capital 1000 USD; risk allowance (80%): 36 USD.",
+                    f"Allocation ID: {rows[1]}; capital 3000 USD; risk allowance (80%): 180 USD.",
                     report,
                 )
                 self.assertEqual(
                     self.app._scenario_data()["selected_allocation"], index
                 )
         self.assertEqual(len(set(self.app.magic_assignments.values())), 2)
+
+    def test_30_percent_allocation_uses_daily_percent_of_total_account(self) -> None:
+        self.app.allocation_percentages[self.row] = Decimal("30")
+        self.assertTrue(self.app._calculate_portfolio(show_error=False))
+        self.assertEqual(
+            self.app.allocation_results[self.row].daily_loss_budget,
+            Decimal("450.0"),
+        )
+        self.assertEqual(
+            self.app.allocation_tree.item(self.row, "values")[6], "450 USD"
+        )
+
+        self.app._generate_settings_checked(show_errors=False)
+        report = self.app.output_text.get("1.0", "end")
+        self.assertIn("Robot daily risk budget: 450 USD", report)
+        self.assertIn("Risk allowance used (80%): 360", report)
+        self.assertIn("80% account-wide allowance 360 USD", report)
 
     def test_missing_data_identifies_the_correct_duplicate_allocation(self) -> None:
         self.app._insert_allocation("US500", "^GSPC", "DCA", "1000")
@@ -2784,11 +3202,16 @@ class CandidateGenerationTests(unittest.TestCase):
         )
 
     def test_full_portfolio_requires_overall_room_and_outputs_each_robot_settings(self) -> None:
-        with self.assertRaisesRegex(ValueError, "UNVERIFIED"):
-            self.app._generate_settings_checked(
-                show_errors=False,
-                require_complete_portfolio=True,
-            )
+        self.app._generate_settings_checked(
+            show_errors=False,
+            require_complete_portfolio=True,
+        )
+        self.assertIn(
+            "PORTFOLIO VERDICT: UNVERIFIED",
+            self.app.output_text.get("1.0", "end"),
+        )
+        with self.assertRaisesRegex(ValueError, "only be copied or exported"):
+            self.app._validated_generated_output()
 
         scenario = self.app._scenario_data()
         scenario["allocations"][0]["robot"] = "RSI"
@@ -2796,6 +3219,7 @@ class CandidateGenerationTests(unittest.TestCase):
         second_allocation["robot"] = "DCA"
         second_allocation["capital"] = "1000"
         second_allocation["allocation_percent"] = ""
+        second_allocation["magic_number"] = None
         scenario["allocations"].append(second_allocation)
         self.app._apply_scenario(validate_scenario(scenario))
         self.app.prop_total_loss_room_var.set("2000")
@@ -2817,7 +3241,7 @@ class CandidateGenerationTests(unittest.TestCase):
             show_errors=False,
             require_complete_portfolio=True,
         )
-        report = self.app._validated_generated_output()
+        report = self.app.output_text.get("1.0", "end")
         self.assertIn("PORTFOLIO VERDICT: ACCEPTED", report)
         self.assertIn("PER-ROBOT CANDIDATE SETTINGS", report)
         allocation_ids = list(self.app.allocations)

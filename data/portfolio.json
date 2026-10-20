@@ -1,0 +1,132 @@
+{
+  "format": "mt5-risk-planner-scenario",
+  "version": 15,
+  "risk_profile": {
+    "enabled": false,
+    "current_equity": "",
+    "daily_start_equity": "",
+    "daily_start_balance": "",
+    "daily_session_date": "",
+    "daily_baseline": "Equity",
+    "overall_rule": "Static",
+    "total_limit_pct": "",
+    "high_water_equity": "",
+    "reset_time": "00:00",
+    "utc_offset_minutes": "0",
+    "idea_limit_pct": "",
+    "free_margin": "",
+    "existing_margin": "",
+    "stopout_pct": "",
+    "holding_days": "0"
+  },
+  "portfolio": {
+    "account_capital": "10000",
+    "currency": "USD",
+    "daily_limit": "4.5",
+    "remaining_daily_loss_room": "",
+    "limit_mode": "Percent of account",
+    "prop_total_loss_room": ""
+  },
+  "new_allocation": {
+    "symbol": "A.cfd",
+    "yahoo_ticker": "^GSPC",
+    "robot": "DCA",
+    "capital": "5000",
+    "allocation_percent": "30"
+  },
+  "allocations": [
+    {
+      "symbol": "US500.cfd",
+      "yahoo_ticker": "^GSPC",
+      "robot": "RSI",
+      "capital": "3000",
+      "allocation_percent": "30",
+      "magic_number": 100013,
+      "broker_contract": {
+        "point_value": "",
+        "point_size": "",
+        "points_per_pip": "",
+        "lot_increment": "",
+        "minimum_lot": "",
+        "maximum_lot": "",
+        "commission_per_lot": "",
+        "contract_currency": ""
+      },
+      "quote": null,
+      "historical_stress": null,
+      "history_source": "",
+      "exposure_inputs": {
+        "margin_per_lot": "",
+        "swap_long_debit": "",
+        "swap_short_debit": "",
+        "idea_group": ""
+      },
+      "history_bars": []
+    },
+    {
+      "symbol": "A.cfd",
+      "yahoo_ticker": "^GSPC",
+      "robot": "DCA",
+      "capital": "3000",
+      "allocation_percent": "30",
+      "magic_number": 10001,
+      "broker_contract": {
+        "point_value": "",
+        "point_size": "",
+        "points_per_pip": "",
+        "lot_increment": "",
+        "minimum_lot": "",
+        "maximum_lot": "",
+        "commission_per_lot": "",
+        "contract_currency": ""
+      },
+      "quote": null,
+      "historical_stress": null,
+      "history_source": "",
+      "exposure_inputs": {
+        "margin_per_lot": "",
+        "swap_long_debit": "",
+        "swap_short_debit": "",
+        "idea_group": ""
+      },
+      "history_bars": []
+    }
+  ],
+  "settings": {
+    "text": {
+      "magic_number": "10001",
+      "step_type": "Percentage",
+      "step_value": "0.5",
+      "point_value": "",
+      "point_size": "",
+      "points_per_pip": "",
+      "contract_currency": "",
+      "spread_points": "3",
+      "slippage_points": "0",
+      "commission_per_lot": "0",
+      "stress_percent": "83.89540313375531804503476186",
+      "stress_mode": "Historical peak-to-trough drawdown (MT5 / Yahoo fallback)",
+      "stress_target_price": "318.3413323648438310677596763",
+      "position_direction": "Short (price rises)",
+      "lot_increment": "",
+      "minimum_lot": "",
+      "compare_trades": "20",
+      "selected_trades": "2",
+      "take_profit_type": "Fixed pips",
+      "take_profit_value": "3",
+      "price_break_type": "break Below",
+      "reference_price": "173.11",
+      "rsi_oversold": "30",
+      "rsi_overbought": "70",
+      "rsi_period": "14"
+    },
+    "options": {
+      "entry_on_price_break": false,
+      "trade_on_new_candle": true,
+      "show_dca_invested_money": true,
+      "close_when_overbought": true,
+      "show_rsi_invested_money": true
+    }
+  },
+  "selected_allocation": 1
+}

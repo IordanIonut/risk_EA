@@ -18,7 +18,7 @@ import tempfile
 import threading
 from typing import TypedDict
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -419,6 +419,7 @@ class MT5SymbolData:
     contract: ContractFields
     bars: tuple[DailyBar, ...]
     quote: QuoteData
+    timeframe_charts: dict[str, list[dict[str, str]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -527,6 +528,70 @@ def inspect_mt5_terminal(
         symbols = getattr(mt5, "symbols_get")()
         if symbols is None:
             raise ValueError(f"MT5 symbol list unavailable: {getattr(mt5, 'last_error')()}.")
+        available_timeframes = sorted(
+            {
+                constant_name.removeprefix("TIMEFRAME_")
+                for constant_name in dir(mt5)
+                if constant_name.startswith("TIMEFRAME_")
+                and isinstance(getattr(mt5, constant_name, None), int)
+                and not isinstance(getattr(mt5, constant_name, None), bool)
+                and getattr(mt5, constant_name, 0) > 0
+            }
+        )
+        account_currency = str(getattr(account, "currency", "") or "")
+        symbol_catalog = []
+        symbol_info = getattr(mt5, "symbol_info", lambda _symbol: None)
+        symbol_info_tick = getattr(mt5, "symbol_info_tick", lambda _symbol: None)
+        for item in symbols:
+            name = str(getattr(item, "name", "") or "").strip()
+            if not name:
+                continue
+            metadata: dict[str, object] = {
+                "symbol": name,
+                "available_in_mt5": True,
+                "available_timeframes": available_timeframes,
+            }
+            info = symbol_info(name)
+            if info is not None:
+                for field, attribute in (
+                    ("description", "description"),
+                    ("path", "path"),
+                    ("digits", "digits"),
+                    ("point_size", "point"),
+                    ("tick_size", "trade_tick_size"),
+                    ("volume_min", "volume_min"),
+                    ("volume_step", "volume_step"),
+                    ("volume_max", "volume_max"),
+                ):
+                    value = getattr(info, attribute, None)
+                    if value is not None:
+                        metadata[field] = str(value)
+                metadata["contract_currency"] = account_currency
+                try:
+                    point_size = Decimal(str(getattr(info, "point", "0")))
+                    tick_size = Decimal(str(getattr(info, "trade_tick_size", "0")))
+                    tick_value = Decimal(
+                        str(
+                            getattr(info, "trade_tick_value_profit", 0)
+                            or getattr(info, "trade_tick_value", 0)
+                        )
+                    )
+                    if min(point_size, tick_size, tick_value) > ZERO:
+                        metadata["point_value"] = str(
+                            tick_value * point_size / tick_size
+                        )
+                except (InvalidOperation, TypeError, ValueError):
+                    pass
+            tick = symbol_info_tick(name)
+            if tick is not None:
+                for field, attribute in (
+                    ("bid", "bid"), ("ask", "ask"), ("last", "last"),
+                    ("quote_time", "time"),
+                ):
+                    value = getattr(tick, attribute, None)
+                    if value is not None:
+                        metadata[field] = str(value)
+            symbol_catalog.append(metadata)
         mode = getattr(account, "trade_mode", None)
         modes = {
             getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0): "DEMO",
@@ -593,6 +658,7 @@ def inspect_mt5_terminal(
             "stopout_mode": str(getattr(account, "margin_so_mode", "")),
             "stopout_level": str(getattr(account, "margin_so_so", "")),
             "risk_details": "\n".join(risk_details),
+            "symbol_catalog": json.dumps(symbol_catalog, ensure_ascii=False),
             "symbols": "\n".join(sorted(
                 str(getattr(symbol, "name", "")) for symbol in symbols
                 if getattr(symbol, "name", "")
@@ -608,6 +674,7 @@ def fetch_mt5_terminal_data(
     history_years: int = 5,
     mt5_module: object | None = None,
     terminal_path: str = "",
+    include_timeframes: bool = False,
 ) -> tuple[str, dict[str, MT5SymbolData]]:
     if (
         isinstance(history_years, bool)
@@ -716,6 +783,63 @@ def fetch_mt5_terminal_data(
             bars_tuple = tuple(bars)
             calculate_historical_stress(bars_tuple)
 
+            timeframe_charts: dict[str, list[dict[str, str]]] = {}
+            timeframe_values: dict[int, str] = {}
+            for constant_name in dir(mt5) if include_timeframes else ():
+                if not constant_name.startswith("TIMEFRAME_"):
+                    continue
+                value = getattr(mt5, constant_name, None)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    continue
+                timeframe_values.setdefault(
+                    value, constant_name.removeprefix("TIMEFRAME_")
+                )
+            copy_rates_from_pos = getattr(mt5, "copy_rates_from_pos", None)
+            for timeframe_value, timeframe_name in sorted(timeframe_values.items()):
+                if timeframe_name == "D1":
+                    timeframe_rates = rates
+                elif callable(copy_rates_from_pos):
+                    try:
+                        timeframe_rates = copy_rates_from_pos(
+                            symbol, timeframe_value, 0, 1000
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        continue
+                    if timeframe_rates is None or len(timeframe_rates) == 0:
+                        continue
+                else:
+                    continue
+                chart_bars: list[dict[str, str]] = []
+                for rate in timeframe_rates:
+                    try:
+                        timestamp = int(rate["time"])
+                        chart_bar = {
+                            "time": datetime.fromtimestamp(
+                                timestamp, timezone.utc
+                            ).isoformat().replace("+00:00", "Z"),
+                            "open": str(rate["open"]),
+                            "high": str(rate["high"]),
+                            "low": str(rate["low"]),
+                            "close": str(rate["close"]),
+                        }
+                        field_names = getattr(
+                            getattr(rate, "dtype", None), "names", ()
+                        )
+                        for optional_field in (
+                            "tick_volume", "spread", "real_volume"
+                        ):
+                            if optional_field in field_names:
+                                chart_bar[optional_field] = str(
+                                    rate[optional_field]
+                                )
+                    except (
+                        KeyError, TypeError, ValueError, OverflowError
+                    ):
+                        continue
+                    chart_bars.append(chart_bar)
+                if chart_bars:
+                    timeframe_charts[timeframe_name] = chart_bars
+
             tick = getattr(mt5, "symbol_info_tick")(symbol)
             ask = Decimal(str(getattr(tick, "ask", "0") or "0"))
             bid = Decimal(str(getattr(tick, "bid", "0") or "0"))
@@ -742,6 +866,7 @@ def fetch_mt5_terminal_data(
                     symbol,
                     quote_time,
                 ),
+                timeframe_charts=timeframe_charts,
             )
         if not result:
             raise ValueError("No MT5 broker symbols were selected for data fetch.")
@@ -1473,7 +1598,7 @@ def build_mt5_set_template(robot: str, settings: dict[str, str]) -> str:
             "Enum_percentage_pips": "0",
             "enum_fixed_pips": "1",
         },
-        "Risk Type": {"Fixed lots": "0"},
+        "Risk Type": {"Fixed lots": "0", "Cash": "1"},
     }
     if robot_type == "DCA":
         fields.update(
@@ -1488,6 +1613,7 @@ def build_mt5_set_template(robot: str, settings: dict[str, str]) -> str:
         enum_values["InpPriceBreakType"] = {}
         enum_values["InpPriceBreakType"] = {
             "break Below": "0",
+            "break above": "1",
             "break Above": "1",
         }
     else:
@@ -1538,7 +1664,9 @@ def build_mt5_set_template(robot: str, settings: dict[str, str]) -> str:
         elif label in decimal_fields:
             numeric_value = decimal_value(value, label)
             if numeric_value < ZERO or (
-                numeric_value == ZERO and label != "Reference Price"
+                numeric_value == ZERO
+                and label != "Reference Price"
+                and not (label == "Risk" and settings.get("Risk Type") == "Fixed lots")
             ):
                 raise ValueError(f"Generated setting '{label}' must be positive.")
         elif label in boolean_fields and value not in ("true", "false"):
@@ -1588,6 +1716,8 @@ class RiskCalculatorApp(tk.Tk):
         self.quote_messages: queue.Queue[tuple[str, str, object]] = queue.Queue()
         self.quote_busy = False
         self.quote_request_cancelled = False
+        self.startup_wait_window: tk.Toplevel | None = None
+        self.startup_wait_progress: ttk.Progressbar | None = None
         self._startup_refresh_after_id: str | None = None
         self.fetch_all_button: ttk.Button | None = None
         self.fetch_mt5_button: ttk.Button | None = None
@@ -1605,6 +1735,7 @@ class RiskCalculatorApp(tk.Tk):
         self.auto_stress_target_price: str | None = None
         self.generated_scenario: dict[str, object] | None = None
         self.generated_output = ""
+        self.generated_requires_accepted_portfolio = False
         self.autosave_path = os.path.join(APP_DATA_DIRECTORY, AUTOSAVE_FILE_NAME)
         self.broker_api_config_path = os.path.join(
             APP_DATA_DIRECTORY, BROKER_API_CONFIG_FILE_NAME
@@ -1613,8 +1744,10 @@ class RiskCalculatorApp(tk.Tk):
         self.broker_api_token_var = tk.StringVar()
         self.mt5_terminal_path_var = tk.StringVar()
         self.mt5_connection: dict[str, str] = {}
+        self.mt5_symbol_catalog: dict[str, dict[str, object]] = {}
         self.mt5_config_path = os.path.join(APP_DATA_DIRECTORY, "mt5_connection.json")
         self.equity_report_path = os.path.join(APP_DATA_DIRECTORY, "equity_validation.json")
+        self.broker_symbol_combo: ttk.Combobox | None = None
         self._autosave_loading = False
         self._autosave_dirty = False
         self._autosave_after_id: str | None = None
@@ -1624,7 +1757,6 @@ class RiskCalculatorApp(tk.Tk):
         self.prop_import_window: tk.Toplevel | None = None
 
         self._build_ui()
-        self._load_broker_api_config()
         self._load_mt5_config()
         self._add_default_allocation()
         self._refresh_allocation_choices()
@@ -1632,6 +1764,7 @@ class RiskCalculatorApp(tk.Tk):
             self._install_autosave_traces()
             self._load_autosave_scenario()
             self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self._refresh_broker_symbol_choices()
         if self.STARTUP_REFRESH_ENABLED:
             self._startup_refresh_after_id = self.after(
                 200, self._refresh_startup_data
@@ -1872,7 +2005,7 @@ class RiskCalculatorApp(tk.Tk):
             data.get("format") != "mt5-risk-planner-scenario"
             or isinstance(version, bool)
             or not isinstance(version, int)
-            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+            or version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
         ):
             raise ValueError("Unsupported or unrecognized scenario file format.")
         risk_profile = validate_profile(
@@ -2014,13 +2147,14 @@ class RiskCalculatorApp(tk.Tk):
                 "commission_per_lot",
                 "contract_currency",
             )
-            if version >= 3 and "broker_contract" not in raw:
+            if version >= 3 and version < 15 and "broker_contract" not in raw:
                 raise ValueError(f"Allocation {position} is missing broker contract data.")
             normalized_contract = {
                 field: (
                     ""
                     if (field == "maximum_lot" and version < 10)
                     or (field == "commission_per_lot" and version < 11)
+                    or (version >= 15 and field not in raw_contract)
                     else (
                         required_text(raw_contract, field)
                         if version >= 3
@@ -2074,11 +2208,11 @@ class RiskCalculatorApp(tk.Tk):
                     )
             historical_stress = None
             if version >= 4:
-                if "historical_stress" not in raw:
+                if "historical_stress" not in raw and version < 15:
                     raise ValueError(
                         f"Allocation {position} is missing historical stress data."
                     )
-                raw_stress = raw["historical_stress"]
+                raw_stress = raw.get("historical_stress")
                 if raw_stress is not None:
                     if not isinstance(raw_stress, dict):
                         raise ValueError(
@@ -2361,7 +2495,15 @@ class RiskCalculatorApp(tk.Tk):
                             ),
                         }
                     )
-                history_source = required_text(raw, "history_source")
+                history_source = (
+                    raw.get("history_source", "")
+                    if version >= 15
+                    else required_text(raw, "history_source")
+                )
+                if not isinstance(history_source, str):
+                    raise ValueError(
+                        f"Allocation {position} history source must be text."
+                    )
                 if history_source not in ("", "Yahoo", *BROKER_HISTORY_SOURCES):
                     raise ValueError(
                         f"Allocation {position} has an unsupported history source."
@@ -2469,8 +2611,17 @@ class RiskCalculatorApp(tk.Tk):
             "close_when_overbought",
             "show_rsi_invested_money",
         )
+        market_text_fields = {
+            "point_value", "point_size", "contract_currency", "lot_increment",
+            "minimum_lot", "points_per_pip",
+        }
         clean_text = {
-            key: required_text(text_settings, key) for key in string_keys
+            key: (
+                ""
+                if version >= 15 and key in market_text_fields and key not in text_settings
+                else required_text(text_settings, key)
+            )
+            for key in string_keys
         }
         for cost_field in (
             "spread_points",
@@ -2670,6 +2821,10 @@ class RiskCalculatorApp(tk.Tk):
         try:
             scenario_data = self._scenario_data()
             self._validate_scenario(scenario_data)
+            if not self._save_symbol_market_data(scenario_data):
+                return False
+            portfolio_data = self._compact_autosave_scenario(scenario_data)
+            self._validate_scenario(portfolio_data)
             directory = os.path.dirname(self.autosave_path)
             os.makedirs(directory, exist_ok=True)
             file_descriptor, temporary_path = tempfile.mkstemp(
@@ -2680,7 +2835,7 @@ class RiskCalculatorApp(tk.Tk):
             )
             with os.fdopen(file_descriptor, "w", encoding="utf-8") as scenario_file:
                 json.dump(
-                    scenario_data,
+                    portfolio_data,
                     scenario_file,
                     ensure_ascii=False,
                     indent=2,
@@ -2708,14 +2863,16 @@ class RiskCalculatorApp(tk.Tk):
         try:
             with open(source_path, "r", encoding="utf-8") as scenario_file:
                 scenario_data = json.load(scenario_file)
-            scenario = self._validate_scenario(scenario_data)
+            scenario = self._validate_scenario(
+                self._restore_symbol_market_data(scenario_data)
+            )
             self._autosave_loading = True
             try:
                 self._apply_scenario(scenario)
             finally:
                 self._autosave_loading = False
             self._autosave_dirty = False
-            if source_path != self.autosave_path:
+            if source_path != self.autosave_path or scenario_data.get("version") != 15:
                 self._autosave_dirty = True
                 if not self._save_autosave_scenario():
                     raise OSError(
@@ -2765,7 +2922,12 @@ class RiskCalculatorApp(tk.Tk):
         try:
             with open(path, "r", encoding="utf-8") as scenario_file:
                 data = json.load(scenario_file)
-            scenario = self._validate_scenario(data)
+            scenario_data = (
+                self._restore_symbol_market_data(data)
+                if isinstance(data, dict) and data.get("version") == 15
+                else data
+            )
+            scenario = self._validate_scenario(scenario_data)
             self._apply_scenario(scenario)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             messagebox.showerror(
@@ -2963,12 +3125,23 @@ class RiskCalculatorApp(tk.Tk):
         assert isinstance(text_settings, dict)
         assert isinstance(option_settings, dict)
         for name, variable in self._scenario_string_settings().items():
-            variable.set(text_settings[name])
+            value = text_settings[name]
+            if (
+                not value
+                and name in (
+                    "point_value", "point_size", "contract_currency",
+                    "lot_increment", "minimum_lot", "points_per_pip",
+                )
+                and selected_row in self.allocations
+            ):
+                value = self.contract_inputs.get(selected_row, {}).get(name, "")
+            variable.set(value)
         for name, variable in self._scenario_boolean_settings().items():
             variable.set(option_settings[name])
         self._update_stress_input_states()
         self._update_robot_options()
         self.output_text.delete("1.0", "end")
+        self._refresh_broker_symbol_choices()
 
     def _build_prop_account_tab(self) -> None:
         ttk.Button(
@@ -3620,9 +3793,9 @@ class RiskCalculatorApp(tk.Tk):
             padding=10,
         )
         entry_box.pack(fill="x", pady=(0, 10))
-        self.index_var = tk.StringVar(value="US500")
-        self.yahoo_ticker_var = tk.StringVar(value="^GSPC")
-        self.auto_yahoo_ticker = "^GSPC"
+        self.index_var = tk.StringVar(value="")
+        self.yahoo_ticker_var = tk.StringVar(value="")
+        self.auto_yahoo_ticker = ""
         self.index_var.trace_add("write", self._suggest_yahoo_ticker)
         self.robot_var = tk.StringVar(value="RSI")
         self.capital_var = tk.StringVar(value="5000")
@@ -3646,6 +3819,17 @@ class RiskCalculatorApp(tk.Tk):
                     state="readonly",
                     width=width,
                 ).grid(row=0, column=column * 2 + 1, sticky="w", padx=(0, 12))
+            elif label == "Broker symbol":
+                self.broker_symbol_combo = ttk.Combobox(
+                    entry_box,
+                    textvariable=variable,
+                    values=(variable.get(),),
+                    state="readonly",
+                    width=width,
+                )
+                self.broker_symbol_combo.grid(
+                    row=0, column=column * 2 + 1, sticky="w", padx=(0, 12)
+                )
             else:
                 ttk.Entry(entry_box, textvariable=variable, width=width).grid(
                     row=0, column=column * 2 + 1, sticky="w", padx=(0, 12)
@@ -3680,7 +3864,7 @@ class RiskCalculatorApp(tk.Tk):
             "capital": "Capital",
             "allocation_pct": "Account %",
             "quote": "Market reference price",
-            "daily": "Daily risk budget",
+            "daily": "Daily robot budget",
         }
         widths = {
             "symbol": 130,
@@ -3755,68 +3939,16 @@ class RiskCalculatorApp(tk.Tk):
         ).pack(side="right", padx=6)
         ttk.Button(
             actions,
-            text="Import MT5 contract CSV",
-            command=self._import_broker_specs,
-        ).pack(side="left", padx=8)
-        ttk.Button(
-            actions,
-            text="Import MT5 OHLC history CSV",
-            command=self._import_mt5_history,
-        ).pack(side="left", padx=8)
-        ttk.Button(
-            actions,
             text="Calculate portfolio budgets",
             command=self._calculate_portfolio,
         ).pack(side="right")
-        broker_api_box = ttk.LabelFrame(
-            self.portfolio_tab,
-            text="Optional broker REST API (normalized JSON, HTTPS)",
-            style="Section.TLabelframe",
-            padding=8,
-        )
-        broker_api_box.pack(fill="x", pady=(2, 5))
-        ttk.Label(
-            broker_api_box,
-            text="Endpoint template",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(
-            broker_api_box,
-            textvariable=self.broker_api_endpoint_var,
-        ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Label(broker_api_box, text="Bearer token (not saved)").grid(
-            row=0, column=2, sticky="w", padx=(0, 6)
-        )
-        ttk.Entry(
-            broker_api_box,
-            textvariable=self.broker_api_token_var,
-            show="*",
-            width=22,
-        ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
-        self.fetch_broker_api_button = ttk.Button(
-            broker_api_box,
-            text="Fetch broker data",
-            command=self._fetch_broker_api_data,
-        )
-        self.fetch_broker_api_button.grid(row=0, column=4, sticky="e")
-        ttk.Label(
-            broker_api_box,
-            text=(
-                "URL placeholders: {symbol}, {start}, {end}, {interval}; "
-                "example: https://broker.example/api/history?symbol={symbol}"
-                "&from={start}&to={end}&interval={interval}. Uses five years of "
-                "daily bars. The endpoint must return the documented JSON schema "
-                "in README; API credentials belong only in the token field."
-            ),
-            wraplength=1080,
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(5, 0))
-        broker_api_box.columnconfigure(1, weight=1)
         ttk.Label(
             self.portfolio_tab,
             text=(
-                "Common symbols supported include US500, US100, US30, GER40, "
-                "UK100, JP225, AUS200, HK50, EU50, FRA40, ESP35, CH20, "
-                "NIFTY50 and more. Edit Yahoo ticker for broker-specific names; "
-                "the Yahoo index may differ from your broker's CFD."
+                "Use Inspect terminal / symbols to populate Broker symbol with "
+                "the broker's available symbols. Selecting and fetching a symbol "
+                "stores its contract and history in its own data folder. Yahoo "
+                "tickers may differ from broker CFD names."
             ),
             wraplength=1080,
         ).pack(fill="x", pady=(7, 0))
@@ -3825,19 +3957,12 @@ class RiskCalculatorApp(tk.Tk):
             text=(
                 "Use Connect MT5 to read account currency, broker contract specs, "
                 "current price and 5 years of D1 bars directly from the logged-in "
-                "terminal (requires the MetaTrader5 Python package). Alternatively, "
-                "the inputs in Robot settings can be entered manually or imported. "
-                "MT5 CSV headers: symbol, point_size, "
-                "point_value_per_point_per_lot (in account currency), "
-                "account_currency, points_per_ea_pip, lot_step, min_lot, "
-                "optional max_lot. "
+                "terminal (requires the MetaTrader5 Python package). Contract "
+                "inputs can also be entered manually in Robot settings. "
                 "Fetch daily history to size fixed lots against each symbol's "
                 "largest peak-to-trough decline; daily shock remains available "
-                "as a separate stress mode. Legacy "
-                "profit_currency headers are accepted cautiously. "
-                "The CSV can be created with ExportMT5ContractSpecs.mq5. For broker OHLC "
-                "history use ExportMT5History.mq5; MT5 history is preferred "
-                "for the imported symbol and Yahoo remains the fallback."
+                "as a separate stress mode. Yahoo remains the fallback when "
+                "broker history is unavailable."
             ),
             wraplength=1080,
         ).pack(fill="x", pady=(3, 0))
@@ -3855,7 +3980,7 @@ class RiskCalculatorApp(tk.Tk):
             lines.extend(
                 f"{key}: {value}"
                 for key, value in self.mt5_connection.items()
-                if key != "symbols"
+                if key not in ("symbols", "symbol_catalog")
             )
             lines.extend(("", "AVAILABLE BROKER SYMBOLS:", self.mt5_connection["symbols"], ""))
         for row_id, allocation in self.allocations.items():
@@ -3924,6 +4049,356 @@ class RiskCalculatorApp(tk.Tk):
         text.pack(fill="both", expand=True)
         text.insert("1.0", self._data_status_text())
         text.configure(state="disabled")
+
+    def _symbol_data_directory(self, symbol: str) -> str:
+        symbol = symbol.strip()
+        if not symbol:
+            raise ValueError("Broker symbol cannot be empty.")
+        folder_name = quote(symbol, safe="._-")
+        if folder_name in (".", ".."):
+            folder_name = "%2E" * len(folder_name)
+        return os.path.join(os.path.dirname(self.autosave_path), folder_name)
+
+    @staticmethod
+    def _write_symbol_cache_file(path: str, content: dict[str, object]) -> None:
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".symbol-", suffix=".tmp", dir=directory, text=True
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as cache_file:
+                json.dump(content, cache_file, ensure_ascii=False, indent=2)
+                cache_file.write("\n")
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def _save_symbol_market_data(self, scenario: dict[str, object]) -> bool:
+        allocations = scenario.get("allocations", [])
+        if not isinstance(allocations, list):
+            return False
+        pending: dict[str, dict[str, object]] = {}
+        contract_fields = (
+            "point_value", "point_size", "lot_increment", "minimum_lot",
+            "maximum_lot", "contract_currency",
+        )
+        for allocation in allocations:
+            if not isinstance(allocation, dict):
+                continue
+            symbol = allocation.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            update = pending.setdefault(
+                symbol,
+                {
+                    "quote": None,
+                    "broker_contract": {},
+                    "historical_stress": None,
+                    "history_source": "",
+                    "history_bars": [],
+                },
+            )
+            if allocation.get("quote") is not None:
+                update["quote"] = allocation["quote"]
+            stress = allocation.get("historical_stress")
+            if stress is not None:
+                update["historical_stress"] = stress
+            source = allocation.get("history_source", "")
+            if isinstance(source, str) and source:
+                update["history_source"] = source
+            bars = allocation.get("history_bars", [])
+            if isinstance(bars, list) and bars:
+                update["history_bars"] = bars
+            contract = allocation.get("broker_contract", {})
+            if isinstance(contract, dict):
+                market_contract = update["broker_contract"]
+                for field in contract_fields:
+                    value = contract.get(field, "")
+                    if isinstance(value, str) and value.strip():
+                        market_contract[field] = value
+
+        success = True
+        for symbol, update in pending.items():
+            try:
+                folder = self._symbol_data_directory(symbol)
+                market_path = os.path.join(folder, "market_data.json")
+                existing_market: dict[str, object] = {}
+                if os.path.isfile(market_path):
+                    try:
+                        with open(market_path, "r", encoding="utf-8") as market_file:
+                            cached = json.load(market_file)
+                        if (
+                            isinstance(cached, dict)
+                            and cached.get("format") == "mt5-risk-planner-symbol-data"
+                            and cached.get("symbol") == symbol
+                        ):
+                            existing_market = cached
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        pass
+                market_contract = existing_market.get("broker_contract", {})
+                merged_contract = (
+                    dict(market_contract) if isinstance(market_contract, dict) else {}
+                )
+                update_contract = update.get("broker_contract", {})
+                if isinstance(update_contract, dict):
+                    merged_contract.update(update_contract)
+                market_data = {
+                    "format": "mt5-risk-planner-symbol-data",
+                    "version": 1,
+                    "symbol": symbol,
+                    "quote": update.get("quote") or existing_market.get("quote"),
+                    "broker_contract": merged_contract,
+                    "historical_stress": (
+                        update.get("historical_stress")
+                        or existing_market.get("historical_stress")
+                    ),
+                    "history_source": (
+                        update.get("history_source")
+                        or existing_market.get("history_source", "")
+                    ),
+                    "history_bars": (
+                        update.get("history_bars")
+                        or existing_market.get("history_bars", [])
+                    ),
+                }
+                self._write_symbol_cache_file(
+                    market_path, market_data
+                )
+                catalog_path = os.path.join(folder, "symbol.json")
+                catalog: dict[str, object] = {}
+                if os.path.isfile(catalog_path):
+                    try:
+                        with open(catalog_path, "r", encoding="utf-8") as catalog_file:
+                            cached = json.load(catalog_file)
+                        if isinstance(cached, dict):
+                            catalog = cached
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        pass
+                catalog.update(self.mt5_symbol_catalog.get(symbol, {}))
+                catalog.update(
+                    {
+                        "symbol": symbol,
+                        "available_in_mt5": bool(
+                            catalog.get("available_in_mt5", False)
+                        ),
+                        "quote": market_data["quote"],
+                        "broker_contract": merged_contract,
+                        "history_source": market_data["history_source"],
+                        "history_bar_count": (
+                            market_data["historical_stress"].get("bar_count", 0)
+                            if isinstance(market_data["historical_stress"], dict) else 0
+                        ),
+                    }
+                )
+                self._write_symbol_cache_file(catalog_path, catalog)
+            except (OSError, ValueError) as error:
+                success = False
+                self.status_var.set(
+                    f"Portfolio saved; symbol cache for {symbol} failed: {error}"
+                )
+        return success
+
+    @staticmethod
+    def _compact_autosave_scenario(
+        scenario: dict[str, object],
+    ) -> dict[str, object]:
+        compact = dict(scenario)
+        compact["version"] = 15
+        allocations = scenario.get("allocations", [])
+        if not isinstance(allocations, list):
+            raise ValueError("Scenario allocations must be a list.")
+        compact_allocations = []
+        for allocation in allocations:
+            if not isinstance(allocation, dict):
+                raise ValueError("Scenario allocations must contain objects.")
+            item = dict(allocation)
+            contract = item.get("broker_contract", {})
+            if not isinstance(contract, dict):
+                contract = {}
+            item["broker_contract"] = {
+                field: contract[field]
+                for field in ("points_per_pip", "commission_per_lot")
+                if isinstance(contract.get(field), str) and contract[field].strip()
+            }
+            for market_field in (
+                "quote", "historical_stress", "history_source", "history_bars"
+            ):
+                item.pop(market_field, None)
+            compact_allocations.append(item)
+        compact["allocations"] = compact_allocations
+        settings = compact.get("settings")
+        if isinstance(settings, dict):
+            text_settings = settings.get("text")
+            if isinstance(text_settings, dict):
+                compact_text = dict(text_settings)
+                for field in (
+                    "point_value", "point_size", "contract_currency",
+                    "lot_increment", "minimum_lot", "points_per_pip",
+                ):
+                    compact_text.pop(field, None)
+                compact_settings = dict(settings)
+                compact_settings["text"] = compact_text
+                compact["settings"] = compact_settings
+        return compact
+
+    def _restore_symbol_market_data(
+        self, scenario: dict[str, object]
+    ) -> dict[str, object]:
+        restored = dict(scenario)
+        allocations = scenario.get("allocations", [])
+        if not isinstance(allocations, list):
+            return restored
+        restored_allocations = []
+        for allocation in allocations:
+            if not isinstance(allocation, dict):
+                restored_allocations.append(allocation)
+                continue
+            item = dict(allocation)
+            symbol = item.get("symbol")
+            if isinstance(symbol, str) and symbol.strip():
+                cache_path = os.path.join(
+                    self._symbol_data_directory(symbol), "market_data.json"
+                )
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as cache_file:
+                        cached = json.load(cache_file)
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    cached = None
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("format") == "mt5-risk-planner-symbol-data"
+                    and cached.get("symbol") == symbol
+                ):
+                    cached_contract = cached.get("broker_contract")
+                    saved_contract = item.get("broker_contract", {})
+                    if isinstance(cached_contract, dict):
+                        merged_contract = dict(saved_contract) if isinstance(
+                            saved_contract, dict
+                        ) else {}
+                        merged_contract.update(cached_contract)
+                        for override in ("points_per_pip", "commission_per_lot"):
+                            saved_value = (
+                                saved_contract.get(override, "")
+                                if isinstance(saved_contract, dict) else ""
+                            )
+                            if isinstance(saved_value, str) and saved_value.strip():
+                                merged_contract[override] = saved_value
+                        item["broker_contract"] = merged_contract
+                    for field in (
+                        "quote", "historical_stress", "history_source", "history_bars"
+                    ):
+                        cached_value = cached.get(field)
+                        if field == "history_bars" and not cached_value:
+                            continue
+                        if field == "history_source" and not cached_value:
+                            continue
+                        if cached_value is not None:
+                            item[field] = cached_value
+            restored_allocations.append(item)
+        restored["allocations"] = restored_allocations
+        return restored
+
+    def _save_symbol_timeframe_charts(
+        self, symbol: str, timeframe_charts: dict[str, list[dict[str, str]]] | None
+    ) -> None:
+        if not timeframe_charts:
+            return
+        try:
+            symbol_directory = self._symbol_data_directory(symbol)
+            charts_directory = os.path.join(symbol_directory, "charts")
+            counts: dict[str, int] = {}
+            for timeframe, bars in timeframe_charts.items():
+                if not bars:
+                    continue
+                filename = quote(timeframe, safe="") + ".json"
+                self._write_symbol_cache_file(
+                    os.path.join(charts_directory, filename),
+                    {
+                        "format": "mt5-risk-planner-timeframe-chart",
+                        "version": 1,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "bar_count": len(bars),
+                        "bars": bars,
+                    },
+                )
+                counts[timeframe] = len(bars)
+            if counts:
+                catalog_path = os.path.join(symbol_directory, "symbol.json")
+                catalog: dict[str, object] = {"symbol": symbol}
+                if os.path.isfile(catalog_path):
+                    try:
+                        with open(catalog_path, "r", encoding="utf-8") as catalog_file:
+                            cached = json.load(catalog_file)
+                        if isinstance(cached, dict):
+                            catalog = cached
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        pass
+                previous_counts = catalog.get("timeframe_bar_counts", {})
+                if not isinstance(previous_counts, dict):
+                    previous_counts = {}
+                previous_counts.update(counts)
+                catalog["timeframe_bar_counts"] = previous_counts
+                catalog["collected_timeframes"] = sorted(previous_counts)
+                self._write_symbol_cache_file(catalog_path, catalog)
+        except (OSError, ValueError) as error:
+            self.status_var.set(
+                f"Market data saved; timeframe chart cache for {symbol} failed: {error}"
+            )
+
+    def _refresh_broker_symbol_choices(
+        self, register_terminal_symbols: bool = False
+    ) -> None:
+        symbols = set(self.mt5_connection.get("symbols", "").splitlines())
+        symbols.update(
+            allocation.index for allocation in self.allocations.values()
+        )
+        try:
+            with os.scandir(os.path.dirname(self.autosave_path)) as directory_entries:
+                entries = list(directory_entries)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if any(
+                os.path.isfile(os.path.join(entry.path, file_name))
+                for file_name in ("symbol.json", "market_data.json")
+            ):
+                cached_symbol = unquote(entry.name).strip()
+                if cached_symbol:
+                    symbols.add(cached_symbol)
+        current_symbol = self.index_var.get().strip()
+        if current_symbol:
+            symbols.add(current_symbol)
+        terminal_symbols = self.mt5_connection.get("symbols", "").splitlines()
+        if register_terminal_symbols:
+            for symbol in terminal_symbols:
+                try:
+                    folder = self._symbol_data_directory(symbol)
+                    catalog_path = os.path.join(folder, "symbol.json")
+                    existing: dict[str, object] = {}
+                    if os.path.isfile(catalog_path):
+                        try:
+                            with open(catalog_path, "r", encoding="utf-8") as catalog_file:
+                                cached = json.load(catalog_file)
+                            if isinstance(cached, dict):
+                                existing = cached
+                        except (OSError, UnicodeError, json.JSONDecodeError):
+                            pass
+                    existing.update(self.mt5_symbol_catalog.get(symbol, {}))
+                    existing.update(
+                        {"symbol": symbol, "available_in_mt5": True}
+                    )
+                    self._write_symbol_cache_file(catalog_path, existing)
+                except (OSError, ValueError):
+                    continue
+        if self.broker_symbol_combo is not None:
+            self.broker_symbol_combo.configure(
+                values=tuple(sorted(symbols, key=str.casefold))
+            )
 
     def _use_mt5_symbol(self, symbol: str) -> None:
         if symbol not in self.mt5_connection.get("symbols", "").splitlines():
@@ -4276,7 +4751,7 @@ class RiskCalculatorApp(tk.Tk):
         ttk.Combobox(
             dca,
             textvariable=self.price_break_type_var,
-            values=("break Below", "break Above"),
+            values=("break Below", "break above"),
             state="readonly",
             width=33,
         ).grid(row=1, column=1, sticky="ew", pady=3)
@@ -4284,9 +4759,9 @@ class RiskCalculatorApp(tk.Tk):
         ttk.Checkbutton(
             dca, text="Trade on new candle", variable=self.trade_new_candle_var
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Checkbutton(
-            dca, text="Show Invested Money", variable=self.show_dca_invested_var
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(dca, text="Show Invested Money: true").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=3
+        )
 
         rsi = ttk.LabelFrame(
             self.robot_options_container,
@@ -4374,7 +4849,16 @@ class RiskCalculatorApp(tk.Tk):
         return entry
 
     def _add_default_allocation(self) -> None:
-        self._insert_allocation("US500", "^GSPC", "RSI", "5000", "50")
+        symbol = self.index_var.get().strip()
+        if not symbol:
+            return
+        self._insert_allocation(
+            symbol,
+            self.yahoo_ticker_var.get().strip(),
+            self.robot_var.get(),
+            self.capital_var.get(),
+            self.allocation_pct_var.get(),
+        )
 
     def _suggest_yahoo_ticker(self, *_args: str) -> None:
         current_ticker = self.yahoo_ticker_var.get().strip()
@@ -5020,7 +5504,7 @@ class RiskCalculatorApp(tk.Tk):
             )
         else:
             self.status_var.set(
-                "Import MT5 history, fetch a Yahoo price, or enter a reference price first."
+                "Connect MT5, fetch a Yahoo price, or enter a reference price first."
             )
 
     def _suggest_stress_target(self, base_price: Decimal | None = None) -> None:
@@ -5304,6 +5788,25 @@ class RiskCalculatorApp(tk.Tk):
         self._startup_refresh_after_id = None
         if self.quote_busy or not self.allocations:
             return
+        required_contract_fields = (
+            "point_value", "point_size", "lot_increment", "minimum_lot",
+            "contract_currency",
+        )
+        missing_contract_rows = {
+            row_id
+            for row_id in self.allocations
+            if any(
+                not self._contract_inputs_for_allocation(row_id).get(field, "").strip()
+                for field in required_contract_fields
+            )
+        }
+        if any(
+            row_id not in self.quotes
+            or row_id not in self.historical_stresses
+            or row_id in missing_contract_rows
+            for row_id in self.allocations
+        ):
+            self._show_startup_data_wait()
         requests = [
             (
                 row_id,
@@ -5312,10 +5815,10 @@ class RiskCalculatorApp(tk.Tk):
                     allocation.index, self.allocation_tree.item(row_id, "values")[1]
                 ),
                 self.history_sources.get(row_id, ""),
+                row_id in missing_contract_rows,
             )
             for row_id, allocation in self.allocations.items()
         ]
-        endpoint = self.broker_api_endpoint_var.get().strip()
         account_currency = self.currency_var.get().strip().upper()
         terminal_path = self.mt5_terminal_path_var.get().strip()
         self._set_fetch_busy(True)
@@ -5323,48 +5826,52 @@ class RiskCalculatorApp(tk.Tk):
 
         def worker() -> None:
             warnings: list[str] = []
-            for row_id, symbol, ticker, source in requests:
-                if source == "MT5 CSV":
+            mt5_symbol_cache: dict[str, tuple[str, MT5SymbolData]] = {}
+            for row_id, symbol, ticker, source, missing_contract in requests:
+                if (
+                    source == "MT5 CSV"
+                    and row_id in self.quotes
+                    and row_id in self.historical_stresses
+                    and not missing_contract
+                ):
                     warnings.append(
                         f"{symbol}: imported MT5 CSV snapshot retained; "
-                        "reimport the CSV or connect MT5 to refresh broker data."
+                        "connect MT5 to refresh broker data."
                     )
                     continue
-                if source in ("MT5 terminal", "Broker API") or (
-                    not source and endpoint
-                ):
+                missing_contract_requires_mt5 = (
+                    missing_contract and source in ("Yahoo", "MT5 CSV", "Broker API")
+                )
+                if source == "MT5 terminal" or missing_contract_requires_mt5:
                     try:
-                        if source == "MT5 terminal":
+                        symbol_key = symbol.strip().upper()
+                        cached_mt5_result = mt5_symbol_cache.get(symbol_key)
+                        if cached_mt5_result is None:
                             currency, data = (
-                                fetch_mt5_terminal_data([symbol], terminal_path=terminal_path)
+                                fetch_mt5_terminal_data(
+                                    [symbol],
+                                    terminal_path=terminal_path,
+                                )
                                 if terminal_path else fetch_mt5_terminal_data([symbol])
                             )
-                            status = "startup_mt5_done"
+                            symbol_data = data[symbol_key]
+                            mt5_symbol_cache[symbol_key] = (currency, symbol_data)
                         else:
-                            currency, data = fetch_broker_api_data(
-                                endpoint, "", [symbol]
-                            )
-                            status = "startup_api_done"
+                            currency, symbol_data = cached_mt5_result
                         if currency != account_currency:
                             raise ValueError(
                                 f"Broker currency {currency} differs from the "
                                 f"configured account currency {account_currency}."
                             )
                         result = MT5PortfolioResult(
-                            {row_id: data[symbol.strip().upper()]}, currency
+                            {row_id: symbol_data}, currency
                         )
-                        self.quote_messages.put((row_id, status, result))
+                        self.quote_messages.put((row_id, "startup_mt5_done", result))
                     except (
                         ValueError, OSError, KeyError, TypeError, AttributeError,
                         OverflowError, InvalidOperation, RuntimeError,
                     ) as error:
-                        detail = str(error)
-                        if source == "Broker API" or (not source and endpoint):
-                            detail += (
-                                " If authentication is required, enter the Bearer "
-                                "token and use Fetch broker data; tokens are not saved."
-                            )
-                        warnings.append(f"{symbol}: {detail} Saved data retained.")
+                        warnings.append(f"{symbol}: {error} Saved data retained.")
                     continue
                 result = self._request_yahoo_data(row_id, ticker)
                 if result.error:
@@ -5374,6 +5881,55 @@ class RiskCalculatorApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, self._poll_quote_result)
+
+    def _show_startup_data_wait(self) -> None:
+        if self.startup_wait_window is not None:
+            return
+        window = tk.Toplevel(self)
+        self.startup_wait_window = window
+        window.title("Collecting initial market data")
+        window.resizable(False, False)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
+        content = ttk.Frame(window, padding=18)
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text=(
+                "Saved market data is incomplete. Please wait while the planner "
+                "refreshes available sources. The screen unlocks when the refresh "
+                "attempt finishes."
+            ),
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x")
+        progress = ttk.Progressbar(content, mode="indeterminate", length=380)
+        progress.pack(fill="x", pady=(12, 0))
+        self.startup_wait_progress = progress
+        progress.start(15)
+        window.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - window.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - window.winfo_height()) // 2
+        window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        window.grab_set()
+        window.lift()
+        window.focus_set()
+
+    def _close_startup_data_wait(self) -> None:
+        window = self.startup_wait_window
+        if window is None:
+            return
+        progress = self.startup_wait_progress
+        self.startup_wait_window = None
+        self.startup_wait_progress = None
+        if progress is not None:
+            progress.stop()
+        try:
+            if window.grab_current() is window:
+                window.grab_release()
+            window.destroy()
+        except tk.TclError:
+            pass
 
     def _fetch_all_yahoo_data(self, only_missing: bool = False) -> None:
         if self.quote_busy:
@@ -5445,6 +6001,7 @@ class RiskCalculatorApp(tk.Tk):
                     [symbol for _, symbol in requested_rows],
                     history_years=5,
                     terminal_path=terminal_path,
+                    include_timeframes=True,
                 )
                 rows = {
                     row_id: symbols[symbol.strip().upper()]
@@ -5599,6 +6156,7 @@ class RiskCalculatorApp(tk.Tk):
                 "mt5_status_done",
             ):
                 self._set_fetch_busy(False)
+                self._close_startup_data_wait()
                 self.quote_request_cancelled = False
             else:
                 self.after(100, self._poll_quote_result)
@@ -5618,6 +6176,18 @@ class RiskCalculatorApp(tk.Tk):
                 return
             data = result.connection
             self.mt5_connection = data
+            try:
+                catalog = json.loads(data.get("symbol_catalog", "[]"))
+            except (TypeError, json.JSONDecodeError):
+                catalog = []
+            self.mt5_symbol_catalog = {
+                item["symbol"]: item
+                for item in catalog
+                if isinstance(item, dict)
+                and isinstance(item.get("symbol"), str)
+                and item["symbol"].strip()
+            }
+            self._refresh_broker_symbol_choices(register_terminal_symbols=True)
             self.status_var.set(
                 f"MT5 {data['account_type']} | {data['broker']} | "
                 f"{data['server']} | {data['currency']}."
@@ -5661,6 +6231,7 @@ class RiskCalculatorApp(tk.Tk):
             return
         if status == "startup_done":
             self._set_fetch_busy(False)
+            self._close_startup_data_wait()
             self._calculate_portfolio(show_error=False)
             self._schedule_autosave()
             if result:
@@ -5742,6 +6313,10 @@ class RiskCalculatorApp(tk.Tk):
                     symbol_data.bars
                 )
                 self.history_sources[row_id] = source_name
+                self._save_symbol_timeframe_charts(
+                    self.allocations[row_id].index,
+                    symbol_data.timeframe_charts,
+                )
                 self.saved_history_rows.discard(row_id)
                 self.cached_data_warnings.pop(row_id, None)
                 self.quotes[row_id] = symbol_data.quote
@@ -6082,6 +6657,13 @@ class RiskCalculatorApp(tk.Tk):
         )
         if candidate_limit > 20:
             raise ValueError("Compare at most 20 Max Trades values.")
+        (
+            account_capital,
+            daily_limit,
+            remaining_daily_room,
+            prop_loss_room,
+            effective_cap,
+        ) = self._portfolio_risk_limits()
 
         for row_id, allocation_result in self.allocation_results.items():
             allocation = allocation_result.allocation
@@ -6321,18 +6903,8 @@ class RiskCalculatorApp(tk.Tk):
                 )
             )
 
-        allocated_daily_budget = sum(
-            (item.daily_loss_budget for item in self.allocation_results.values()),
-            ZERO,
-        )
-        (
-            account_capital,
-            daily_limit,
-            remaining_daily_room,
-            prop_loss_room,
-            effective_cap,
-        ) = self._portfolio_risk_limits()
-        portfolio_working_allowance = allocated_daily_budget * Decimal("0.8")
+        allocated_daily_budget = effective_cap
+        portfolio_working_allowance = effective_cap * Decimal("0.8")
 
         report = [
             "",
@@ -6472,6 +7044,13 @@ class RiskCalculatorApp(tk.Tk):
                         used_magic_numbers.add(magic_number)
                         next_magic_number += 1
                     self.magic_assignments[allocation_id] = magic_number
+                minimum_lot = decimal_value(
+                    self._contract_inputs_for_allocation(allocation_id)["minimum_lot"],
+                    f"{symbol} minimum lot",
+                )
+                risk_setting = (
+                    "0.0" if lot == minimum_lot else format_decimal(lot)
+                )
                 report.extend(
                     [
                         "",
@@ -6483,7 +7062,7 @@ class RiskCalculatorApp(tk.Tk):
                         f"Take Profit Type: {take_profit_type}",
                         f"Take Profit Value: {take_profit_value}",
                         "Risk Type: Fixed lots",
-                        f"Risk: {format_decimal(lot)}",
+                        f"Risk: {risk_setting}",
                         "Multiplier Factor: 1.0",
                     ]
                 )
@@ -6493,7 +7072,7 @@ class RiskCalculatorApp(tk.Tk):
                     "-" * 80,
                     f"{'Partial' if missing else 'Combined'} modeled loss: "
                     f"{format_decimal(total_estimated_loss, 2)} {currency} / "
-                    f"80% allocated allowance {format_decimal(portfolio_working_allowance, 2)} "
+                    f"80% account-wide allowance {format_decimal(portfolio_working_allowance, 2)} "
                     f"{currency} / effective portfolio cap "
                     f"{format_decimal(effective_cap, 2)} {currency} / daily account "
                     f"limit {format_decimal(daily_limit, 2)} {currency}",
@@ -6520,8 +7099,11 @@ class RiskCalculatorApp(tk.Tk):
                     "the remaining daily-loss room if today's loss is nonzero."
                 )
             if not missing:
-                if total_estimated_loss > daily_limit:
-                    report.append("PORTFOLIO WARNING: modeled loss exceeds daily limit.")
+                if total_estimated_loss > effective_cap:
+                    report.append(
+                        "PORTFOLIO WARNING: combined modeled loss exceeds the "
+                        "account-wide daily risk cap."
+                    )
                 elif total_estimated_loss > portfolio_working_allowance:
                     report.append(
                         "PORTFOLIO WARNING: modeled loss exceeds the 20% safety-reserved "
@@ -6611,8 +7193,8 @@ class RiskCalculatorApp(tk.Tk):
             )
         if not rows:
             report.append(
-                "No combined estimate: import MT5 contract specifications and fetch "
-                "MT5 history or Yahoo prices for the allocations."
+                "No combined estimate: connect MT5 or fetch Yahoo prices and history "
+                "for the allocations; enter missing contract data in Robot settings."
             )
         if drawdown_mode:
             report.append(
@@ -6639,6 +7221,7 @@ class RiskCalculatorApp(tk.Tk):
     ) -> None:
         self.generated_scenario = None
         self.generated_output = ""
+        self.generated_requires_accepted_portfolio = require_complete_portfolio
         self.output_text.delete("1.0", "end")
         if not self._calculate_portfolio(show_error=show_errors):
             if require_complete_portfolio:
@@ -6656,6 +7239,7 @@ class RiskCalculatorApp(tk.Tk):
         if row_id is None:
             raise ValueError("Select an allocation.")
         allocation_result = self.allocation_results[row_id]
+        robot_risk_budget = allocation_result.daily_loss_budget
         allocation = allocation_result.allocation
         contract = self._contract_inputs_for_allocation(row_id)
         spread_points, slippage_points, commission_per_lot = self._sizing_costs(
@@ -6697,7 +7281,7 @@ class RiskCalculatorApp(tk.Tk):
             )
         if row_id not in self.quotes:
             raise ValueError(
-                "Import MT5 OHLC history or fetch a Yahoo price/history for this allocation first."
+                "Connect MT5 or fetch a Yahoo price/history for this allocation first."
             )
         price, quote_currency, yahoo_symbol, quote_time = self.quotes[row_id]
         price_in_account = decimal_value(
@@ -6760,7 +7344,7 @@ class RiskCalculatorApp(tk.Tk):
         elif historical_mode:
             if historical_stress is None:
                 raise ValueError(
-                    "Import MT5 OHLC history or fetch Yahoo daily history for this "
+                    "Connect MT5 or fetch Yahoo daily history for this "
                     "allocation before using historical stress settings."
                 )
             stress_percent = historical_stress_move(
@@ -6840,7 +7424,7 @@ class RiskCalculatorApp(tk.Tk):
                         step_value if step_type != "enum_fixed_pips" else step_points
                     ),
                     step_is_percentage=step_type != "enum_fixed_pips",
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     lot_step=lot_increment,
                     minimum_lot=minimum_lot,
                     spread_points=spread_points,
@@ -6855,7 +7439,7 @@ class RiskCalculatorApp(tk.Tk):
                     stress_points=stress_points,
                     step_points=step_points,
                     point_value_per_lot=point_value,
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     lot_step=lot_increment,
                     minimum_lot=minimum_lot,
                     spread_points=historical_spread_floor(
@@ -6909,7 +7493,7 @@ class RiskCalculatorApp(tk.Tk):
                     initial_lot=ONE,
                     max_trades=trades,
                     multiplier=ONE,
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     spread_points=spread_points,
                     slippage_points=slippage_points,
                     commission_per_lot=commission_per_lot,
@@ -6924,7 +7508,7 @@ class RiskCalculatorApp(tk.Tk):
                     multiplier=ONE,
                     max_trades=trades,
                     stress_points=stress_points,
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     spread_points=candidate_spread_points,
                     slippage_points=slippage_points,
                     commission_per_lot=commission_per_lot,
@@ -6955,7 +7539,7 @@ class RiskCalculatorApp(tk.Tk):
                     initial_lot=candidate_lot,
                     max_trades=trades,
                     multiplier=ONE,
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     spread_points=spread_points,
                     slippage_points=slippage_points,
                     commission_per_lot=commission_per_lot,
@@ -6969,7 +7553,7 @@ class RiskCalculatorApp(tk.Tk):
                     multiplier=ONE,
                     max_trades=trades,
                     stress_points=stress_points,
-                    daily_budget=allocation_result.daily_loss_budget,
+                    daily_budget=robot_risk_budget,
                     spread_points=candidate_spread_points,
                     slippage_points=slippage_points,
                     commission_per_lot=commission_per_lot,
@@ -6984,6 +7568,11 @@ class RiskCalculatorApp(tk.Tk):
                 "trades, reduce the stress scenario only if justified, or "
                 "change the capital/risk allocation."
             )
+        risk_setting = (
+            "0.0"
+            if selected_lot == minimum_lot
+            else format_decimal(selected_lot)
+        )
 
         magic_number = positive_integer(self.magic_var.get(), "Magic Number")
         if magic_number > 2147483647:
@@ -7022,10 +7611,10 @@ class RiskCalculatorApp(tk.Tk):
             f"Adverse move: {format_decimal(stress_percent, 2)}% = "
             f"{format_decimal(stress_points, 2)} MT5 points",
             f"Robot daily risk budget: "
-            f"{format_decimal(allocation_result.daily_loss_budget, 2)} "
+            f"{format_decimal(robot_risk_budget, 2)} "
             f"{self.currency_var.get().strip() or 'account currency'}",
             f"Risk allowance used (80%): "
-            f"{format_decimal(allocation_result.daily_loss_budget * Decimal('0.8'), 2)}",
+            f"{format_decimal(robot_risk_budget * Decimal('0.8'), 2)}",
             "",
             "MAX TRADES CANDIDATES (Multiplier Factor = 1.0)",
             f"{'Max Trades':>12} {'Risk Type':>14} {'Risk (lots)':>16}",
@@ -7084,13 +7673,16 @@ class RiskCalculatorApp(tk.Tk):
                 f"Take Profit Type: {take_profit_type}",
                 f"Take Profit Value: {take_profit_output}",
                 "Risk Type: Fixed lots",
-                f"Risk: {format_decimal(selected_lot)}",
+                f"Risk: {risk_setting}",
                 "Multiplier Factor: 1.0",
             ]
         )
 
         if robot == "DCA":
             enabled = self.entry_break_var.get()
+            price_break_type = self.price_break_type_var.get()
+            if price_break_type == "break Above":
+                price_break_type = "break above"
             ref_text = self.reference_price_var.get().strip()
             if enabled:
                 if not ref_text:
@@ -7103,10 +7695,10 @@ class RiskCalculatorApp(tk.Tk):
             output.extend(
                 [
                     f"Entry on price break: {str(enabled).lower()}",
-                    f"InpPriceBreakType: {self.price_break_type_var.get()}",
+                    f"InpPriceBreakType: {price_break_type}",
                     f"Reference Price: {format_decimal(reference_price)}",
                     f"Trade on new candle: {str(self.trade_new_candle_var.get()).lower()}",
-                    f"Show Invested Money: {str(self.show_dca_invested_var.get()).lower()}",
+                    "Show Invested Money: true",
                 ]
             )
         else:
@@ -7179,8 +7771,8 @@ class RiskCalculatorApp(tk.Tk):
             output.extend(
                 [
                     "",
-                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION: not run; import MT5 "
-                    "history first (Yahoo-only history is not sufficient).",
+                    "CHRONOLOGICAL GRID CAMPAIGN SIMULATION: not run; connect MT5 "
+                    "and fetch broker history first (Yahoo-only history is not sufficient).",
                 ]
             )
         elif not take_profit_text:
@@ -7261,9 +7853,9 @@ class RiskCalculatorApp(tk.Tk):
                         (
                             "Daily allowance check (80% reserved budget): PASS."
                             if campaign.worst_daily_loss
-                            <= allocation_result.daily_loss_budget * Decimal("0.8")
+                            <= robot_risk_budget * Decimal("0.8")
                             else "WARNING: modeled daily loss exceeds the "
-                            "80%-reserved allocation budget."
+                            "80%-reserved account-wide allowance."
                         ),
                         f"Maximum concurrent entries: "
                         f"{campaign.max_open_trades}; basket TP closes: "
@@ -7285,7 +7877,7 @@ class RiskCalculatorApp(tk.Tk):
                         (
                             "WARNING: history has missing daily opens; those bars "
                             "use the previous close clamped to their high/low range. "
-                            "Gap execution is approximate; reimport MT5 OHLC data."
+                            "Gap execution is approximate; refresh MT5 history."
                             if any(bar.open is None for bar in mt5_bars[1:])
                             else "Daily opens are available for gap modeling; "
                             "intraday order still uses the adverse-first assumption."
@@ -7304,32 +7896,6 @@ class RiskCalculatorApp(tk.Tk):
             take_profit_output,
             require_complete_portfolio,
         )
-        if require_complete_portfolio:
-            missing_report = next(
-                (
-                    line
-                    for line in portfolio_report
-                    if line.startswith("Not included (missing data):")
-                    or line.startswith("PORTFOLIO VERDICT: UNVERIFIED")
-                ),
-                None,
-            )
-            if missing_report:
-                raise ValueError(
-                    "Cannot accept the full portfolio. " + missing_report
-                )
-            if not any(
-                line.startswith("PORTFOLIO VERDICT: ACCEPTED")
-                for line in portfolio_report
-            ):
-                raise ValueError(
-                    "The portfolio did not pass the configured 80% acceptance "
-                    "threshold or enabled advanced constraints. "
-                    + " ".join(
-                        line for line in portfolio_report
-                        if line.startswith(("PORTFOLIO VERDICT:", "ADVANCED BREACH:"))
-                    )
-                )
         output.extend(portfolio_report)
         output.extend(
             [
@@ -7388,6 +7954,14 @@ class RiskCalculatorApp(tk.Tk):
             raise ValueError(
                 "Inputs, market data, selection, or report text have changed. "
                 "Regenerate candidate settings before copying or exporting."
+            )
+        if (
+            self.generated_requires_accepted_portfolio
+            and "PORTFOLIO VERDICT: ACCEPTED" not in content
+        ):
+            raise ValueError(
+                "Full-portfolio settings can only be copied or exported when "
+                "the final portfolio verdict is ACCEPTED. Review the report."
             )
         return content
 
