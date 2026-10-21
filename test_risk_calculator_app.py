@@ -1736,6 +1736,10 @@ class CandidateGenerationTests(unittest.TestCase):
     def test_mt5_symbol_selection_only_prefills_new_allocation_without_mutating_existing(self) -> None:
         before = dict(self.app.allocations)
         self.app.mt5_connection = {"symbols": "US500.cash\nDE40.demo"}
+        self.app.mt5_symbol_catalog = {
+            symbol: {"path": "CFD Indices"}
+            for symbol in ("US500.cash", "DE40.demo")
+        }
         self.app._use_mt5_symbol("US500.cash")
         self.assertEqual(self.app.index_var.get(), "US500.cash")
         self.assertEqual(self.app.allocations, before)
@@ -2328,9 +2332,12 @@ class CandidateGenerationTests(unittest.TestCase):
 
         self.assertIn("Connect MT5: get specs + 5y D1", labels)
         self.assertIsNotNone(self.app.broker_symbol_combo)
-        self.assertIn(
-            self.app.index_var.get(), self.app.broker_symbol_combo["values"]
-        )
+        self.app.mt5_connection = {"symbols": "US500.cfd"}
+        self.app.mt5_symbol_catalog = {
+            "US500.cfd": {"symbol": "US500.cfd", "path": "CFD Indices"}
+        }
+        self.app._refresh_broker_symbol_choices()
+        self.assertIn("US500.cfd", self.app.broker_symbol_combo["values"])
         for removed_control in (
             "Import MT5 contract CSV",
             "Import MT5 OHLC history CSV",
@@ -2339,6 +2346,42 @@ class CandidateGenerationTests(unittest.TestCase):
             "Fetch broker data",
         ):
             self.assertFalse(any(removed_control in label for label in labels))
+
+    def test_symbol_folder_filter_uses_mt5_category_not_symbol_name(self) -> None:
+        is_index = APP["RiskCalculatorApp"]._is_index_symbol_metadata
+        self.assertTrue(
+            is_index({"path": r"TMS\CFD Indices\Group 1\US500.cfd"})
+        )
+        self.assertFalse(
+            is_index({"path": r"TMS\CFD Stocks\US\NASDAQ\AAPL.cfd"})
+        )
+
+    def test_prunes_inactive_non_index_folders_but_preserves_active_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app._insert_allocation("A.cfd", "A", "DCA", "1000")
+            folders = {
+                "AAPL.cfd": {"path": r"TMS\CFD Stocks\US\NASDAQ"},
+                "US500.cfd": {"path": r"TMS\CFD Indices\Group 1"},
+                "MSFT.cfd": {"path": r"TMS\CFD Stocks\US\NASDAQ"},
+                "A.cfd": {"path": r"TMS\CFD Stocks\US\NYSE"},
+            }
+            for symbol, metadata in folders.items():
+                folder = Path(self.app._symbol_data_directory(symbol))
+                folder.mkdir(parents=True)
+                (folder / "symbol.json").write_text(
+                    json.dumps({"symbol": symbol, **metadata}), encoding="utf-8"
+                )
+            (Path(self.app._symbol_data_directory("MSFT.cfd")) / "market_data.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            self.app._prune_unused_non_index_catalogs()
+
+            self.assertFalse(Path(self.app._symbol_data_directory("AAPL.cfd")).exists())
+            self.assertTrue(Path(self.app._symbol_data_directory("US500.cfd")).exists())
+            self.assertFalse(Path(self.app._symbol_data_directory("MSFT.cfd")).exists())
+            self.assertTrue(Path(self.app._symbol_data_directory("A.cfd")).exists())
 
     def test_mt5_symbol_inspection_populates_dropdown_and_creates_symbol_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2349,11 +2392,13 @@ class CandidateGenerationTests(unittest.TestCase):
             self.app.mt5_symbol_catalog = {
                 "NAS100.cash": {
                     "symbol": "NAS100.cash",
+                    "path": "CFD Indices\\US",
                     "point_size": "0.1",
                     "point_value": "1.0",
                 },
                 "US500.cfd": {
                     "symbol": "US500.cfd",
+                    "path": "CFD Indices\\US",
                     "point_size": "0.1",
                     "point_value": "1.0",
                 },
@@ -2385,6 +2430,11 @@ class CandidateGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.app.AUTOSAVE_ENABLED = True
             self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.mt5_symbol_catalog["US500"] = {
+                "symbol": "US500",
+                "path": "CFD Indices\\US",
+                "available_in_mt5": True,
+            }
             self.assertTrue(self.app._save_autosave_scenario())
 
             cache = json.loads(
@@ -2397,6 +2447,51 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(cache["format"], "mt5-risk-planner-symbol-data")
         self.assertEqual(cache["broker_contract"]["point_size"], "1")
         self.assertEqual(len(cache["history_bars"]), 20)
+
+    def test_symbol_cache_writes_indices_and_preserves_active_non_index_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.mt5_symbol_catalog = {
+                "A.cfd": {"path": "CFD Stocks\\US\\NYSE"},
+                "AAPL.cfd": {"path": "CFD Stocks\\US\\NASDAQ"},
+                "DAX.cfd": {"path": "CFD Indices\\Group 3"},
+            }
+            active_folder = Path(self.app._symbol_data_directory("A.cfd"))
+            active_folder.mkdir(parents=True)
+            (active_folder / "market_data.json").write_text(
+                json.dumps({
+                    "format": "mt5-risk-planner-symbol-data",
+                    "symbol": "A.cfd",
+                    "history_bars": [],
+                }),
+                encoding="utf-8",
+            )
+            allocations = [
+                {
+                    "symbol": symbol,
+                    "quote": {"price": "1"},
+                    "broker_contract": {},
+                    "historical_stress": None,
+                    "history_source": "MT5 terminal",
+                    "history_bars": [],
+                }
+                for symbol in ("A.cfd", "AAPL.cfd", "DAX.cfd")
+            ]
+
+            self.assertTrue(
+                self.app._save_symbol_market_data({"allocations": allocations})
+            )
+
+            self.assertTrue((active_folder / "market_data.json").is_file())
+            self.assertFalse(
+                Path(self.app._symbol_data_directory("AAPL.cfd")).exists()
+            )
+            self.assertTrue(
+                (
+                    Path(self.app._symbol_data_directory("DAX.cfd"))
+                    / "market_data.json"
+                ).is_file()
+            )
 
     def test_timeframe_charts_are_saved_in_the_symbol_folder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2684,9 +2779,47 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(self.app.quotes[self.row][0], Decimal("105"))
         self.assertFalse(self.app.quote_busy)
 
+    def test_v16_portfolio_without_symbol_cache_fetches_mt5_on_startup(self) -> None:
+        self.app.deiconify()
+        self.app.update_idletasks()
+        self.app.current_settings_row = None
+        self.app.history_sources.pop(self.row, None)
+        self.app.contract_inputs[self.row] = {
+            field: "" for field in self.app._contract_input_variables()
+        }
+        contract = {
+            "point_value": "1",
+            "point_size": "1",
+            "points_per_pip": "1",
+            "lot_increment": "0.01",
+            "minimum_lot": "0.01",
+            "maximum_lot": "10",
+            "commission_per_lot": "",
+            "contract_currency": "USD",
+        }
+        data = APP["MT5SymbolData"](
+            contract,
+            self.app.history_bars[self.row],
+            (Decimal("101"), "USD", "US500", "now"),
+        )
+        fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
+        with patch.dict(
+            self.app._refresh_startup_data.__globals__,
+            fetch_mt5_terminal_data=fetch,
+        ):
+            self._run_startup_worker()
+
+        fetch.assert_called_once_with(["US500"])
+        with patch.object(self.app, "after"):
+            self.app._poll_quote_result()
+            self.app._poll_quote_result()
+        self.assertEqual(self.app.quotes[self.row][0], Decimal("101"))
+        self.assertFalse(self.app.quote_busy)
+
     def test_startup_failure_does_not_stop_other_allocations(self) -> None:
         self.app._insert_allocation("US100", "^NDX", "DCA", "1000")
         second = list(self.app.allocations)[-1]
+        self.app.contract_inputs[second] = dict(self.app.contract_inputs[self.row])
         self.app.history_sources[self.row] = "Yahoo"
         before = self.app.quotes[self.row]
         results = [
@@ -2696,6 +2829,7 @@ class CandidateGenerationTests(unittest.TestCase):
                 self.app.historical_stresses[self.row], None,
             ),
         ]
+        self.app.current_settings_row = None
         with patch.object(self.app, "_request_yahoo_data", side_effect=results):
             self._run_startup_worker()
         with patch.object(self.app, "after"), patch.object(
@@ -2753,11 +2887,16 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app.AUTOSAVE_ENABLED = True
         with tempfile.TemporaryDirectory() as directory:
             self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.mt5_symbol_catalog["US500"] = {
+                "symbol": "US500",
+                "path": "CFD Indices\\US",
+                "available_in_mt5": True,
+            }
             self.app.symbol_commission_per_lot_var.set("7")
             self.assertTrue(self.app._save_autosave_scenario())
             saved = json.loads(Path(self.app.autosave_path).read_text(encoding="utf-8"))
             self.assertEqual(saved["format"], "mt5-risk-planner-scenario")
-            self.assertEqual(saved["version"], 15)
+            self.assertEqual(saved["version"], 16)
             for market_field in (
                 "quote", "historical_stress", "history_source", "history_bars"
             ):
@@ -2796,12 +2935,55 @@ class CandidateGenerationTests(unittest.TestCase):
         self.assertEqual(self.app.symbol_commission_per_lot_var.get(), "7")
         self.assertEqual(self.app.points_per_pip_var.get(), "1")
 
+    def test_compact_autosave_omits_empty_broker_contract(self) -> None:
+        scenario = self.app._scenario_data()
+        scenario["allocations"][0]["broker_contract"] = {
+            field: "" for field in self.app._contract_input_variables()
+        }
+
+        compact = self.app._compact_autosave_scenario(scenario)
+
+        self.assertNotIn("broker_contract", compact["allocations"][0])
+
+    def test_v16_autosave_recompacts_existing_empty_market_placeholders(self) -> None:
+        self.app.AUTOSAVE_ENABLED = True
+        self.app.contract_inputs[self.row]["points_per_pip"] = ""
+        self.app.points_per_pip_var.set("")
+        self.app.contract_inputs[self.row]["commission_per_lot"] = ""
+        self.app.symbol_commission_per_lot_var.set("")
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            scenario = self.app._scenario_data()
+            self.assertTrue(self.app._save_symbol_market_data(scenario))
+            compact = self.app._compact_autosave_scenario(scenario)
+            compact["allocations"][0]["broker_contract"] = {}
+            Path(self.app.autosave_path).write_text(
+                json.dumps(compact), encoding="utf-8"
+            )
+
+            self.app._load_autosave_scenario()
+            saved = json.loads(
+                Path(self.app.autosave_path).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(saved["version"], 16)
+        self.assertNotIn("broker_contract", saved["allocations"][0])
+        for field in (
+            "quote", "historical_stress", "history_source", "history_bars"
+        ):
+            self.assertNotIn(field, saved["allocations"][0])
+
     def test_legacy_v14_autosave_migrates_market_data_into_symbol_cache(self) -> None:
         self.app.AUTOSAVE_ENABLED = True
         legacy = self.app._scenario_data()
         legacy["version"] = 14
         with tempfile.TemporaryDirectory() as directory:
             self.app.autosave_path = str(Path(directory) / "portfolio.json")
+            self.app.mt5_symbol_catalog["US500"] = {
+                "symbol": "US500",
+                "path": "CFD Indices\\US",
+                "available_in_mt5": True,
+            }
             Path(self.app.autosave_path).write_text(
                 json.dumps(legacy), encoding="utf-8"
             )
@@ -2819,7 +3001,7 @@ class CandidateGenerationTests(unittest.TestCase):
             )
 
         allocation = migrated["allocations"][0]
-        self.assertEqual(migrated["version"], 15)
+        self.assertEqual(migrated["version"], 16)
         for market_field in (
             "quote", "historical_stress", "history_source", "history_bars"
         ):

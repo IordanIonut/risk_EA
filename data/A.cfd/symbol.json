@@ -39,10 +39,10 @@
     "W1"
   ],
   "quote": {
-    "price": "173.11",
+    "price": "7725.7",
     "currency": "USD",
-    "symbol": "A.cfd",
-    "timestamp": "2026-10-21 00:59"
+    "symbol": "^GSPC",
+    "timestamp": "2026-10-21 16:34"
   },
   "broker_contract": {
     "point_value": "1.0",
@@ -54,8 +54,8 @@
     "commission_per_lot": "",
     "contract_currency": "USD"
   },
-  "history_source": "MT5 terminal",
-  "history_bar_count": 1254,
+  "history_source": "Yahoo",
+  "history_bar_count": 1255,
   "timeframe_bar_counts": {
     "M1": 1000,
     "M2": 1000,

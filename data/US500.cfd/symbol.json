@@ -2,10 +2,10 @@
   "symbol": "US500.cfd",
   "available_in_mt5": true,
   "quote": {
-    "price": "7724.5",
+    "price": "7725.92",
     "currency": "USD",
-    "symbol": "US500.cfd",
-    "timestamp": "2026-10-21 01:15"
+    "symbol": "^GSPC",
+    "timestamp": "2026-10-21 16:34"
   },
   "broker_contract": {
     "point_value": "1.0",
@@ -17,8 +17,8 @@
     "commission_per_lot": "",
     "contract_currency": "USD"
   },
-  "history_source": "MT5 terminal",
-  "history_bar_count": 1292,
+  "history_source": "Yahoo",
+  "history_bar_count": 1255,
   "description": "S&P 500 Index Cash",
   "path": "TMS\\CFD Indices\\Group 1\\US500.cfd",
   "digits": "1",

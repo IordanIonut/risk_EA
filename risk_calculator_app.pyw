@@ -13,6 +13,7 @@ from html.parser import HTMLParser
 import os
 import queue
 import re
+import shutil
 from string import Formatter
 import tempfile
 import threading
@@ -1764,7 +1765,9 @@ class RiskCalculatorApp(tk.Tk):
             self._install_autosave_traces()
             self._load_autosave_scenario()
             self.protocol("WM_DELETE_WINDOW", self._close_app)
-        self._refresh_broker_symbol_choices()
+        self._refresh_broker_symbol_choices(
+            prune_inactive_non_index=self.AUTOSAVE_ENABLED
+        )
         if self.STARTUP_REFRESH_ENABLED:
             self._startup_refresh_after_id = self.after(
                 200, self._refresh_startup_data
@@ -2872,7 +2875,34 @@ class RiskCalculatorApp(tk.Tk):
             finally:
                 self._autosave_loading = False
             self._autosave_dirty = False
-            if source_path != self.autosave_path or scenario_data.get("version") != 15:
+            saved_allocations = scenario_data.get("allocations", [])
+            market_fields = {
+                "quote", "historical_stress", "history_source", "history_bars"
+            }
+            needs_compaction = (
+                source_path != self.autosave_path
+                or scenario_data.get("version") != 16
+                or any(
+                    isinstance(item, dict)
+                    and (
+                        any(field in item for field in market_fields)
+                        or ("broker_contract" in item and not item["broker_contract"])
+                    )
+                    for item in saved_allocations
+                )
+            )
+            saved_settings = scenario_data.get("settings", {})
+            if isinstance(saved_settings, dict):
+                saved_text_settings = saved_settings.get("text", {})
+                if isinstance(saved_text_settings, dict) and any(
+                    field in saved_text_settings
+                    for field in (
+                        "point_value", "point_size", "contract_currency",
+                        "lot_increment", "minimum_lot", "points_per_pip",
+                    )
+                ):
+                    needs_compaction = True
+            if needs_compaction:
                 self._autosave_dirty = True
                 if not self._save_autosave_scenario():
                     raise OSError(
@@ -4029,7 +4059,11 @@ class RiskCalculatorApp(tk.Tk):
         window = tk.Toplevel(self)
         window.title("Market data status")
         window.geometry("950x600")
-        symbols = self.mt5_connection.get("symbols", "").splitlines()
+        symbols = [
+            symbol
+            for symbol in self.mt5_connection.get("symbols", "").splitlines()
+            if self._is_index_symbol(symbol)
+        ]
         if symbols:
             chooser = ttk.Frame(window, padding=6)
             chooser.pack(fill="x")
@@ -4049,6 +4083,55 @@ class RiskCalculatorApp(tk.Tk):
         text.pack(fill="both", expand=True)
         text.insert("1.0", self._data_status_text())
         text.configure(state="disabled")
+
+    @staticmethod
+    def _is_index_symbol_metadata(metadata: object) -> bool:
+        return (
+            isinstance(metadata, dict)
+            and "indices" in str(metadata.get("path", "")).casefold()
+        )
+
+    def _is_index_symbol(self, symbol: str) -> bool:
+        metadata = self.mt5_symbol_catalog.get(symbol)
+        if metadata is not None:
+            return self._is_index_symbol_metadata(metadata)
+        try:
+            with open(
+                os.path.join(self._symbol_data_directory(symbol), "symbol.json"),
+                "r",
+                encoding="utf-8",
+            ) as catalog_file:
+                metadata = json.load(catalog_file)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return self._is_index_symbol_metadata(metadata)
+
+    def _prune_unused_non_index_catalogs(self) -> None:
+        active_symbols = {allocation.index for allocation in self.allocations.values()}
+        try:
+            with os.scandir(os.path.dirname(self.autosave_path)) as entries:
+                directories = list(entries)
+        except OSError:
+            return
+        for entry in directories:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            symbol = unquote(entry.name).strip()
+            if not symbol or symbol in active_symbols or self._is_index_symbol(symbol):
+                continue
+            catalog_path = os.path.join(entry.path, "symbol.json")
+            try:
+                with open(catalog_path, "r", encoding="utf-8") as catalog_file:
+                    catalog = json.load(catalog_file)
+                if (
+                    not isinstance(catalog, dict)
+                    or not str(catalog.get("path", "")).strip()
+                    or self._is_index_symbol_metadata(catalog)
+                ):
+                    continue
+                shutil.rmtree(entry.path)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
 
     def _symbol_data_directory(self, symbol: str) -> str:
         symbol = symbol.strip()
@@ -4089,6 +4172,10 @@ class RiskCalculatorApp(tk.Tk):
                 continue
             symbol = allocation.get("symbol")
             if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            if not self._is_index_symbol(symbol) and not os.path.isfile(
+                os.path.join(self._symbol_data_directory(symbol), "market_data.json")
+            ):
                 continue
             update = pending.setdefault(
                 symbol,
@@ -4144,6 +4231,16 @@ class RiskCalculatorApp(tk.Tk):
                 update_contract = update.get("broker_contract", {})
                 if isinstance(update_contract, dict):
                     merged_contract.update(update_contract)
+                history_source = (
+                    update.get("history_source")
+                    or existing_market.get("history_source", "")
+                )
+                history_bars = (
+                    update.get("history_bars")
+                    or existing_market.get("history_bars", [])
+                )
+                if history_source not in BROKER_HISTORY_SOURCES:
+                    history_bars = []
                 market_data = {
                     "format": "mt5-risk-planner-symbol-data",
                     "version": 1,
@@ -4154,14 +4251,8 @@ class RiskCalculatorApp(tk.Tk):
                         update.get("historical_stress")
                         or existing_market.get("historical_stress")
                     ),
-                    "history_source": (
-                        update.get("history_source")
-                        or existing_market.get("history_source", "")
-                    ),
-                    "history_bars": (
-                        update.get("history_bars")
-                        or existing_market.get("history_bars", [])
-                    ),
+                    "history_source": history_source,
+                    "history_bars": history_bars,
                 }
                 self._write_symbol_cache_file(
                     market_path, market_data
@@ -4205,7 +4296,7 @@ class RiskCalculatorApp(tk.Tk):
         scenario: dict[str, object],
     ) -> dict[str, object]:
         compact = dict(scenario)
-        compact["version"] = 15
+        compact["version"] = 16
         allocations = scenario.get("allocations", [])
         if not isinstance(allocations, list):
             raise ValueError("Scenario allocations must be a list.")
@@ -4222,6 +4313,8 @@ class RiskCalculatorApp(tk.Tk):
                 for field in ("points_per_pip", "commission_per_lot")
                 if isinstance(contract.get(field), str) and contract[field].strip()
             }
+            if not item["broker_contract"]:
+                item.pop("broker_contract", None)
             for market_field in (
                 "quote", "historical_stress", "history_source", "history_bars"
             ):
@@ -4290,6 +4383,13 @@ class RiskCalculatorApp(tk.Tk):
                         "quote", "historical_stress", "history_source", "history_bars"
                     ):
                         cached_value = cached.get(field)
+                        cached_source = cached.get("history_source", "")
+                        if (
+                            field == "history_bars"
+                            and cached_source not in BROKER_HISTORY_SOURCES
+                        ):
+                            item[field] = []
+                            continue
                         if field == "history_bars" and not cached_value:
                             continue
                         if field == "history_source" and not cached_value:
@@ -4349,11 +4449,18 @@ class RiskCalculatorApp(tk.Tk):
             )
 
     def _refresh_broker_symbol_choices(
-        self, register_terminal_symbols: bool = False
+        self,
+        register_terminal_symbols: bool = False,
+        prune_inactive_non_index: bool = False,
     ) -> None:
-        symbols = set(self.mt5_connection.get("symbols", "").splitlines())
+        terminal_symbols = self.mt5_connection.get("symbols", "").splitlines()
+        symbols = {
+            symbol for symbol in terminal_symbols if self._is_index_symbol(symbol)
+        }
         symbols.update(
-            allocation.index for allocation in self.allocations.values()
+            allocation.index
+            for allocation in self.allocations.values()
+            if self._is_index_symbol(allocation.index)
         )
         try:
             with os.scandir(os.path.dirname(self.autosave_path)) as directory_entries:
@@ -4363,19 +4470,16 @@ class RiskCalculatorApp(tk.Tk):
         for entry in entries:
             if not entry.is_dir():
                 continue
-            if any(
-                os.path.isfile(os.path.join(entry.path, file_name))
-                for file_name in ("symbol.json", "market_data.json")
-            ):
-                cached_symbol = unquote(entry.name).strip()
-                if cached_symbol:
-                    symbols.add(cached_symbol)
+            cached_symbol = unquote(entry.name).strip()
+            if cached_symbol and self._is_index_symbol(cached_symbol):
+                symbols.add(cached_symbol)
         current_symbol = self.index_var.get().strip()
-        if current_symbol:
+        if current_symbol and self._is_index_symbol(current_symbol):
             symbols.add(current_symbol)
-        terminal_symbols = self.mt5_connection.get("symbols", "").splitlines()
         if register_terminal_symbols:
             for symbol in terminal_symbols:
+                if not self._is_index_symbol(symbol):
+                    continue
                 try:
                     folder = self._symbol_data_directory(symbol)
                     catalog_path = os.path.join(folder, "symbol.json")
@@ -4395,15 +4499,20 @@ class RiskCalculatorApp(tk.Tk):
                     self._write_symbol_cache_file(catalog_path, existing)
                 except (OSError, ValueError):
                     continue
+        if prune_inactive_non_index or register_terminal_symbols:
+            self._prune_unused_non_index_catalogs()
         if self.broker_symbol_combo is not None:
             self.broker_symbol_combo.configure(
                 values=tuple(sorted(symbols, key=str.casefold))
             )
 
     def _use_mt5_symbol(self, symbol: str) -> None:
-        if symbol not in self.mt5_connection.get("symbols", "").splitlines():
+        if (
+            symbol not in self.mt5_connection.get("symbols", "").splitlines()
+            or not self._is_index_symbol(symbol)
+        ):
             messagebox.showerror(
-                "MT5 symbol", "Select an exact symbol returned by the inspected terminal.",
+                "MT5 symbol", "Select an index returned by the inspected terminal.",
                 parent=self,
             )
             return
@@ -5840,7 +5949,8 @@ class RiskCalculatorApp(tk.Tk):
                     )
                     continue
                 missing_contract_requires_mt5 = (
-                    missing_contract and source in ("Yahoo", "MT5 CSV", "Broker API")
+                    missing_contract
+                    and source in ("", "Yahoo", "MT5 CSV", "Broker API")
                 )
                 if source == "MT5 terminal" or missing_contract_requires_mt5:
                     try:
