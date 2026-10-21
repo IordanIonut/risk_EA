@@ -5909,10 +5909,13 @@ class RiskCalculatorApp(tk.Tk):
                 for field in required_contract_fields
             )
         }
+        missing_market_rows = {
+            row_id
+            for row_id in self.allocations
+            if row_id not in self.quotes or row_id not in self.historical_stresses
+        }
         if any(
-            row_id not in self.quotes
-            or row_id not in self.historical_stresses
-            or row_id in missing_contract_rows
+            row_id in missing_market_rows or row_id in missing_contract_rows
             for row_id in self.allocations
         ):
             self._show_startup_data_wait()
@@ -5925,6 +5928,7 @@ class RiskCalculatorApp(tk.Tk):
                 ),
                 self.history_sources.get(row_id, ""),
                 row_id in missing_contract_rows,
+                row_id in missing_market_rows,
             )
             for row_id, allocation in self.allocations.items()
         ]
@@ -5936,12 +5940,13 @@ class RiskCalculatorApp(tk.Tk):
         def worker() -> None:
             warnings: list[str] = []
             mt5_symbol_cache: dict[str, tuple[str, MT5SymbolData]] = {}
-            for row_id, symbol, ticker, source, missing_contract in requests:
+            for row_id, symbol, ticker, source, missing_contract, missing_market in requests:
                 if (
                     source == "MT5 CSV"
                     and row_id in self.quotes
                     and row_id in self.historical_stresses
                     and not missing_contract
+                    and not missing_market
                 ):
                     warnings.append(
                         f"{symbol}: imported MT5 CSV snapshot retained; "
@@ -5949,7 +5954,7 @@ class RiskCalculatorApp(tk.Tk):
                     )
                     continue
                 missing_contract_requires_mt5 = (
-                    missing_contract
+                    (missing_contract or missing_market)
                     and source in ("", "Yahoo", "MT5 CSV", "Broker API")
                 )
                 if source == "MT5 terminal" or missing_contract_requires_mt5:

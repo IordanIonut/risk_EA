@@ -39,10 +39,10 @@
     "W1"
   ],
   "quote": {
-    "price": "7725.7",
+    "price": "7729.74",
     "currency": "USD",
     "symbol": "^GSPC",
-    "timestamp": "2026-10-21 16:34"
+    "timestamp": "2026-10-21 16:35"
   },
   "broker_contract": {
     "point_value": "1.0",

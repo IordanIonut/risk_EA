@@ -2784,22 +2784,13 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app.update_idletasks()
         self.app.current_settings_row = None
         self.app.history_sources.pop(self.row, None)
-        self.app.contract_inputs[self.row] = {
-            field: "" for field in self.app._contract_input_variables()
-        }
-        contract = {
-            "point_value": "1",
-            "point_size": "1",
-            "points_per_pip": "1",
-            "lot_increment": "0.01",
-            "minimum_lot": "0.01",
-            "maximum_lot": "10",
-            "commission_per_lot": "",
-            "contract_currency": "USD",
-        }
+        bars = self.app.history_bars.pop(self.row)
+        self.app.quotes.pop(self.row)
+        self.app.historical_stresses.pop(self.row)
+        contract = dict(self.app.contract_inputs[self.row])
         data = APP["MT5SymbolData"](
             contract,
-            self.app.history_bars[self.row],
+            bars,
             (Decimal("101"), "USD", "US500", "now"),
         )
         fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
