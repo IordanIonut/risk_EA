@@ -2,10 +2,10 @@
   "symbol": "US500.cfd",
   "available_in_mt5": true,
   "quote": {
-    "price": "7729.31",
+    "price": "7737.15",
     "currency": "USD",
     "symbol": "^GSPC",
-    "timestamp": "2026-10-21 16:35"
+    "timestamp": "2026-10-21 16:48"
   },
   "broker_contract": {
     "point_value": "1.0",

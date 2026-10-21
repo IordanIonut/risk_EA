@@ -2570,18 +2570,22 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app.update_idletasks()
         self.app.quotes.pop(self.row)
         self.app.history_sources[self.row] = "Yahoo"
-        result = APP["YahooDataResult"](
-            self.row,
-            (Decimal("101"), "USD", "^GSPC", "now"),
-            self.app.historical_stresses[self.row],
-            None,
+        data = APP["MT5SymbolData"](
+            dict(self.app.contract_inputs[self.row]),
+            self.app.history_bars[self.row],
+            (Decimal("101"), "USD", "US500", "now"),
         )
-        with patch.object(self.app, "_request_yahoo_data", return_value=result):
+        fetch = unittest.mock.Mock(return_value=("USD", {"US500": data}))
+        with patch.dict(
+            self.app._refresh_startup_data.__globals__,
+            fetch_mt5_terminal_data=fetch,
+        ):
             self._run_startup_worker()
 
         wait_window = self.app.startup_wait_window
         self.assertIsNotNone(wait_window)
         self.assertIs(self.app.grab_current(), wait_window)
+        fetch.assert_called_once_with(["US500"])
         with patch.object(self.app, "after"):
             self.app._poll_quote_result()
             self.assertIs(self.app.startup_wait_window, wait_window)
@@ -2811,6 +2815,9 @@ class CandidateGenerationTests(unittest.TestCase):
         self.app._insert_allocation("US100", "^NDX", "DCA", "1000")
         second = list(self.app.allocations)[-1]
         self.app.contract_inputs[second] = dict(self.app.contract_inputs[self.row])
+        self.app.quotes[second] = (Decimal("100"), "USD", "^NDX", "old")
+        self.app.historical_stresses[second] = self.app.historical_stresses[self.row]
+        self.app.history_sources[second] = "Yahoo"
         self.app.history_sources[self.row] = "Yahoo"
         before = self.app.quotes[self.row]
         results = [
